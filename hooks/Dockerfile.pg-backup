@@ -1,0 +1,24 @@
+# Match the tag to your Postgres MAJOR version (your server is postgres:17-alpine),
+# so pg_dump is compatible with the server.
+FROM prodrigestivill/postgres-backup-local:17
+
+# AWS CLI v2 for shipping dumps to S3 from the post-backup hook.
+# Base image is Debian, so install via the official AWS installer (arch-aware).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl unzip ca-certificates; \
+    case "$(uname -m)" in \
+      x86_64)  awscli_arch="x86_64" ;; \
+      aarch64) awscli_arch="aarch64" ;; \
+      *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip; \
+    unzip -q /tmp/awscliv2.zip -d /tmp; \
+    /tmp/aws/install; \
+    rm -rf /tmp/aws /tmp/awscliv2.zip; \
+    apt-get purge -y --auto-remove unzip; \
+    rm -rf /var/lib/apt/lists/*; \
+    aws --version
+
+COPY hooks/ /hooks/
+RUN chmod +x /hooks/*

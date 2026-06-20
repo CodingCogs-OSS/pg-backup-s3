@@ -71,26 +71,43 @@ aws s3 sync "${BACKUP_DIR:-/backups}" "s3://${S3_BUCKET}/${S3_PREFIX:-pg-backups
 This keeps your S3 copy in lockstep with the local `last/daily/weekly/monthly`
 folders, including rotation deletes.
 
-## Building
+## Restoring
 
-The Dockerfile lives under `hooks/`, but the build context must be the parent
-directory so the `hooks/` folder is included:
+Backups are gzipped SQL dumps named `<db>-<timestamp>.sql.gz`, kept under the
+`last/daily/weekly/monthly` folders both locally and in S3.
 
-```bash
-docker build -f hooks/Dockerfile.pg-backup \
-  -t cc0funobit/pg-backup-s3:17 \
-  -t cc0funobit/pg-backup-s3:latest .
-```
-
-Multi-arch build and push:
+**1. Find the dump you want**
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f hooks/Dockerfile.pg-backup \
-  -t cc0funobit/pg-backup-s3:17 \
-  -t cc0funobit/pg-backup-s3:latest \
-  --push .
+# List available daily backups in S3
+aws s3 ls s3://my-backup-bucket/pg-backups/daily/
 ```
+
+**2. Download it from S3** (KMS decryption happens automatically if your IAM
+identity has `kms:Decrypt`):
+
+```bash
+aws s3 cp s3://my-backup-bucket/pg-backups/daily/app-20260620-030000.sql.gz .
+```
+
+**3. Restore into Postgres**
+
+```bash
+gunzip -c app-20260620-030000.sql.gz | psql -h db -U app -d app
+```
+
+Or restore the latest backup straight from S3 without writing to disk:
+
+```bash
+aws s3 cp s3://my-backup-bucket/pg-backups/last/app-latest.sql.gz - \
+  | gunzip \
+  | psql -h db -U app -d app
+```
+
+> Tip: restore into a fresh/empty database to avoid conflicts. To recreate
+> roles and other cluster-wide objects first, restore the matching
+> `pg_dumpall` globals file (`*globals*.sql.gz`) the same way before the
+> per-database dump.
 
 ## Docker Hub
 
@@ -112,6 +129,28 @@ docker pull cc0funobit/pg-backup-s3:17
 - Make sure the `pg_dump` major version matches your server's major version.
 - The IAM identity needs `s3:PutObject` / `s3:ListBucket` on the target bucket
   and `kms:GenerateDataKey` on the KMS key used for encryption.
+- For restores, that identity also needs `s3:GetObject` and `kms:Decrypt`.
+
+## Building from source
+
+The Dockerfile lives under `hooks/`, but the build context must be the parent
+directory so the `hooks/` folder is included:
+
+```bash
+docker build -f hooks/Dockerfile.pg-backup \
+  -t cc0funobit/pg-backup-s3:17 \
+  -t cc0funobit/pg-backup-s3:latest .
+```
+
+Multi-arch build and push:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f hooks/Dockerfile.pg-backup \
+  -t cc0funobit/pg-backup-s3:17 \
+  -t cc0funobit/pg-backup-s3:latest \
+  --push .
+```
 
 ## License
 

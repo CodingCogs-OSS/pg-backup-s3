@@ -1,10 +1,188 @@
 #!/bin/sh
+# post-backup: ship the local backup tree to one or more S3 destinations,
+# optionally encrypting each destination's copy with a passphrase.
+#
+# Destinations
+#   #1 (primary) : S3_BUCKET, S3_PREFIX, S3_REGION, S3_ENDPOINT, S3_SSE,
+#                  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   #N (extra)   : the same names with a _N suffix, e.g. S3_BUCKET_2,
+#                  S3_ENDPOINT_2, AWS_SECRET_ACCESS_KEY_2. Per-destination
+#                  values that are empty fall back to the unsuffixed value.
+#
+#   S3_DELETE[_N]  true|false (default true): mirror local rotation by removing
+#                  remote objects that no longer exist locally. Set to false to
+#                  keep an append-only remote copy.
+#
+# Encryption (per destination, disabled by default)
+#   ENCRYPTION_ENABLED[_N]     true|false    (default false)
+#   ENCRYPTION_METHOD[_N]      gpg|openssl   (default gpg)
+#   ENCRYPTION_PASSPHRASE[_N]  passphrase
+#
+# Secrets can be supplied indirectly with a *_FILE companion variable, e.g.
+#   AWS_SECRET_ACCESS_KEY_FILE, AWS_SECRET_ACCESS_KEY_2_FILE,
+#   ENCRYPTION_PASSPHRASE_FILE. (POSTGRES_PASSWORD_FILE is handled by the
+#   base image.)
+
 set -eu
 
-: "${S3_BUCKET:?S3_BUCKET not set}"
+BACKUP_DIR="${BACKUP_DIR:-/backups}"
 
-# Mirror the local backup layout (last/daily/weekly/monthly) into S3.
-# --sse encrypts at rest; backups contain PII so keep this on.
-aws s3 sync "${BACKUP_DIR:-/backups}" "s3://${S3_BUCKET}/${S3_PREFIX:-pg-backups}" \
-  --sse aws:kms \
-  --only-show-errors
+log() { printf '[post-backup] %s\n' "$*" >&2; }
+
+is_true() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# value of ${BASE}${SFX}; if a suffixed lookup is empty, fall back to ${BASE}
+getval() {
+  _b="$1"; _s="$2"
+  eval "_v=\${${_b}${_s}:-}"
+  if [ -n "$_s" ] && [ -z "$_v" ]; then eval "_v=\${${_b}:-}"; fi
+  printf '%s' "$_v"
+}
+
+# like getval, but also honours a *_FILE companion that holds the value
+getsecret() {
+  _b="$1"; _s="$2"
+  eval "_v=\${${_b}${_s}:-}"
+  eval "_f=\${${_b}${_s}_FILE:-}"
+  if [ -z "$_v" ] && [ -n "$_f" ]; then _v=$(cat "$_f"); fi
+  if [ -n "$_s" ] && [ -z "$_v" ]; then
+    eval "_v=\${${_b}:-}"
+    eval "_f=\${${_b}_FILE:-}"
+    if [ -z "$_v" ] && [ -n "$_f" ]; then _v=$(cat "$_f"); fi
+  fi
+  printf '%s' "$_v"
+}
+
+# server-side-encryption value: an explicit setting always wins; otherwise
+# default to aws:kms for real AWS and to none when a custom endpoint is used
+get_sse() {
+  _s="$1"; _ep="$2"
+  eval "_set=\${S3_SSE${_s}+x}"
+  if [ "${_set:-}" = x ]; then eval "_v=\${S3_SSE${_s}}"; printf '%s' "$_v"; return; fi
+  if [ -n "$_s" ]; then
+    eval "_set=\${S3_SSE+x}"
+    if [ "${_set:-}" = x ]; then printf '%s' "${S3_SSE:-}"; return; fi
+  fi
+  if [ -n "$_ep" ]; then printf ''; else printf 'aws:kms'; fi
+}
+
+encrypt_file() {
+  _m="$1"; _p="$2"; _in="$3"; _out="$4"
+  case "$_m" in
+    gpg)
+      printf '%s' "$_p" | gpg --batch --yes --pinentry-mode loopback \
+        --passphrase-fd 0 --cipher-algo AES256 --compress-algo none \
+        -o "$_out" -c "$_in" ;;
+    openssl)
+      ENC_PASS="$_p" openssl enc -aes-256-cbc -pbkdf2 -salt \
+        -pass env:ENC_PASS -in "$_in" -out "$_out" ;;
+    *)
+      log "unknown ENCRYPTION_METHOD '$_m'"; return 1 ;;
+  esac
+}
+
+ship_one() {
+  id="$1"
+  if [ "$id" = primary ]; then sfx=""; else sfx="_$id"; fi
+
+  eval "bucket=\${S3_BUCKET${sfx}:-}"
+  if [ -z "$bucket" ]; then log "destination $id: no bucket set, skipping"; return 0; fi
+
+  # post-backup runs after a dump, so BACKUP_DIR should hold files; bail out if
+  # it is empty so a --delete sync can never wipe the remote copy
+  if [ -z "$(find "$BACKUP_DIR" -type f -print -quit 2>/dev/null)" ]; then
+    log "destination $id: nothing under $BACKUP_DIR to ship, skipping"
+    return 0
+  fi
+
+  prefix=$(getval S3_PREFIX "$sfx"); [ -n "$prefix" ] || prefix="pg-backups"
+  region=$(getval S3_REGION "$sfx"); [ -n "$region" ] || region="${AWS_DEFAULT_REGION:-}"
+  endpoint=$(getval S3_ENDPOINT "$sfx")
+  sse=$(get_sse "$sfx" "$endpoint")
+  akid=$(getsecret AWS_ACCESS_KEY_ID "$sfx")
+  asak=$(getsecret AWS_SECRET_ACCESS_KEY "$sfx")
+
+  [ -n "$akid" ] && export AWS_ACCESS_KEY_ID="$akid"
+  [ -n "$asak" ] && export AWS_SECRET_ACCESS_KEY="$asak"
+  [ -n "$region" ] && export AWS_DEFAULT_REGION="$region"
+
+  # --delete mirrors local rotation by default; S3_DELETE=false makes it append-only
+  want_delete=$(getval S3_DELETE "$sfx"); [ -n "$want_delete" ] || want_delete="true"
+
+  # build the shared aws flags as positional args (id is already saved above)
+  set --
+  [ -n "$endpoint" ] && set -- "$@" --endpoint-url "$endpoint"
+  [ -n "$sse" ] && set -- "$@" --sse "$sse"
+  is_true "$want_delete" && set -- "$@" --delete
+
+  target="s3://${bucket}/${prefix}"
+
+  if is_true "$(getval ENCRYPTION_ENABLED "$sfx")"; then
+    method=$(getval ENCRYPTION_METHOD "$sfx"); [ -n "$method" ] || method="gpg"
+    pass=$(getsecret ENCRYPTION_PASSPHRASE "$sfx")
+    if [ -z "$pass" ]; then
+      log "destination $id: encryption enabled but no passphrase configured"
+      return 1
+    fi
+    case "$method" in
+      gpg) ext=".gpg" ;;
+      openssl) ext=".enc" ;;
+      *) log "destination $id: unknown ENCRYPTION_METHOD '$method'"; return 1 ;;
+    esac
+
+    stage=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$stage\"" EXIT INT TERM
+
+    filelist=$(mktemp)
+    find "$BACKUP_DIR" -type f > "$filelist"
+    while IFS= read -r src; do
+      rel=${src#"$BACKUP_DIR"/}
+      out="$stage/$rel$ext"
+      mkdir -p "$(dirname "$out")"
+      encrypt_file "$method" "$pass" "$src" "$out"
+    done < "$filelist"
+    rm -f "$filelist"
+
+    log "destination $id: syncing encrypted ($method) backups to $target"
+    # staging is a full re-render of the current backup tree, so a --delete sync
+    # (the default) keeps the remote in lockstep with local rotation; leaving
+    # --delete off (S3_DELETE=false) makes the remote accumulate ciphertext
+    aws s3 sync "$stage" "$target" "$@" --only-show-errors
+
+    rm -rf "$stage"
+    trap - EXIT INT TERM
+  else
+    log "destination $id: syncing backups to $target"
+    aws s3 sync "$BACKUP_DIR" "$target" "$@" --only-show-errors
+  fi
+}
+
+# Enumerate destinations: primary (unsuffixed S3_BUCKET) plus any S3_BUCKET_<n>.
+dest_ids=""
+[ -n "${S3_BUCKET:-}" ] && dest_ids="primary"
+for n in $(env | sed -n 's/^S3_BUCKET_\([0-9][0-9]*\)=.*/\1/p' | sort -n -u); do
+  dest_ids="$dest_ids $n"
+done
+
+if [ -z "$dest_ids" ]; then
+  log "no S3 destination configured (set S3_BUCKET and/or S3_BUCKET_<n>)"
+  exit 1
+fi
+
+# Run every destination in its own subshell so per-destination credentials and
+# flags never leak between targets; report failure if any destination fails.
+rc=0
+for id in $dest_ids; do
+  if ! ( ship_one "$id" ); then
+    log "destination $id: FAILED"
+    rc=1
+  fi
+done
+
+exit $rc

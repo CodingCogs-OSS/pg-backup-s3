@@ -2,11 +2,12 @@
 # so pg_dump is compatible with the server.
 FROM prodrigestivill/postgres-backup-local:17
 
-# AWS CLI v2 for shipping dumps to S3 from the post-backup hook.
-# Base image is Debian, so install via the official AWS installer (arch-aware).
+# AWS CLI v2 for shipping dumps to S3 from the post-backup hook, plus gnupg and
+# openssl for the optional password-based backup encryption.
+# Base image is Debian, so install AWS CLI via the official installer (arch-aware).
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends curl unzip ca-certificates; \
+    apt-get install -y --no-install-recommends curl unzip ca-certificates gnupg openssl; \
     case "$(uname -m)" in \
       x86_64)  awscli_arch="x86_64" ;; \
       aarch64) awscli_arch="aarch64" ;; \

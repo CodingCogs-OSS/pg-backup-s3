@@ -5,26 +5,30 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Scheduled PostgreSQL backups that are automatically synced to one or more S3
-destinations, with optional password-based encryption. It builds on the
-excellent
+destinations, each on its own schedule, with optional password-based encryption.
+It builds on the excellent
 [`prodrigestivill/postgres-backup-local`](https://hub.docker.com/r/prodrigestivill/postgres-backup-local)
-image and adds the AWS CLI plus a `post-backup` hook, so every local dump is
-mirrored off-site without any extra moving parts.
+image and adds the AWS CLI, a `post-backup` hook, and a per-destination sync
+scheduler, so every local dump is mirrored off-site without any extra moving
+parts.
 
 ## Why
 
 `postgres-backup-local` already handles scheduled `pg_dump` runs and rotation
 (last / daily / weekly / monthly). This image keeps all of that and ships each
-backup to S3 the moment it's written, giving you durable off-site copies of
-databases that may contain PII. You can fan the same backups out to several
-buckets (even across providers) and encrypt the off-site copies with a
-passphrase you control.
+backup to S3, giving you durable off-site copies of databases that may contain
+PII. You can fan the same backups out to several buckets (even across
+providers), encrypt the off-site copies with a passphrase you control, and give
+each bucket its own sync cadence instead of pushing to all of them after every
+dump.
 
 ## Features
 
 - Scheduled Postgres dumps with the familiar `last/daily/weekly/monthly` layout
 - Fan-out to **multiple S3 destinations**, each with its own credentials,
   region, and endpoint (AWS S3, Backblaze B2, MinIO, …)
+- **Per-destination sync schedule** (`S3_SCHEDULE[_N]`): keep a hot bucket in
+  sync after every dump while a cold/DR bucket only receives a weekly push
 - **Per-destination encryption** (off by default) via GPG or OpenSSL, so the
   off-site copy is protected by a passphrase only you hold
 - Server-side encryption via `--sse aws:kms` (auto-disabled for non-AWS
@@ -82,10 +86,12 @@ services:
       ENCRYPTION_PASSPHRASE_FILE: /run/secrets/backup_pass
 
       # --- Destination #2: Backblaze B2, own keys + endpoint, unencrypted ---
+      # Synced every Sunday at 04:00 instead of after every dump
       S3_BUCKET_2: dr-bucket
       S3_PREFIX_2: pg-backups
       S3_REGION_2: us-west-002
       S3_ENDPOINT_2: https://s3.us-west-002.backblazeb2.com
+      S3_SCHEDULE_2: "0 4 * * 0"
       AWS_ACCESS_KEY_ID_2: 0021...
       AWS_SECRET_ACCESS_KEY_2_FILE: /run/secrets/aws_secret_2
       # S3_SSE_2 left unset -> defaults to none because an endpoint is set
@@ -125,6 +131,66 @@ variables convenient shared defaults.
 | `AWS_SECRET_ACCESS_KEY` / `_N`    | _(required)_            | Secret key for that destination (supports `_FILE`)           |
 | `BACKUP_DIR`                      | `/backups`              | Local directory that gets synced to S3                       |
 
+### Sync scheduling (per destination)
+
+By default every destination is synced right after each dump, so all buckets
+receive the same backup at the same time. Set `S3_SCHEDULE[_N]` on a destination
+to take it out of that path and give it its own cadence instead: the image then
+runs a small cron scheduler per scheduled destination and syncs it on that
+schedule only.
+
+| Variable (and `_N` form)     | Default                                | Description                                                            |
+|------------------------------|----------------------------------------|------------------------------------------------------------------------|
+| `S3_SCHEDULE` / `_N`         | _(none = sync after every backup)_     | Cron spec for this destination's sync. Same syntax as `SCHEDULE`: 5 (or 6, seconds first) fields, or a descriptor such as `@daily`, `@weekly`, `@every 6h`. Use `none` to opt a destination out of an inherited unsuffixed `S3_SCHEDULE` |
+| `S3_SYNC_ON_BACKUP` / `_N`   | `true` without a schedule, else `false`| Sync this destination right after each dump. Set `true` alongside a schedule to do both |
+| `S3_SYNC_ON_START` / `_N`    | `false`                                | A scheduled destination also syncs once at container start (like `BACKUP_ON_START`) |
+
+Global knobs (not per destination):
+
+| Variable                | Default             | Description                                                                 |
+|-------------------------|---------------------|-----------------------------------------------------------------------------|
+| `S3_SYNC_SCHEDULER`     | `true`              | Set `false` to skip starting the per-destination schedulers entirely         |
+| `S3_SYNC_LOCK_WAIT`     | `1800`              | Seconds a sync waits for another sync to finish before skipping its run      |
+| `S3_SYNC_BACKUP_WAIT`   | `300`               | Seconds a scheduled sync waits for an in-flight dump to finish              |
+| `S3_SYNC_STATE_DIR`     | `/tmp/pg-backup-s3` | Where the sync lock and the "dump in progress" marker live                   |
+
+Example: hot bucket after every dump, DR bucket every Sunday at 04:00, cold
+archive daily plus once at start.
+
+```yaml
+environment:
+  SCHEDULE: "@daily"
+
+  S3_BUCKET: hot-bucket            # no S3_SCHEDULE -> synced after every dump
+
+  S3_BUCKET_2: dr-bucket
+  S3_SCHEDULE_2: "0 4 * * 0"       # weekly, decoupled from the dump schedule
+
+  S3_BUCKET_3: cold-bucket
+  S3_SCHEDULE_3: "@daily"
+  S3_SYNC_ON_START_3: "true"
+```
+
+Notes:
+
+- Scheduled syncs push whatever is in `BACKUP_DIR` at that moment, so a
+  destination on a weekly schedule ships the dumps that survived local rotation
+  (`BACKUP_KEEP_*`) until then. Keep local retention long enough to cover the
+  gap between syncs.
+- Syncs are serialized: only one destination is ever uploading at a time, and a
+  scheduled sync waits for a running dump so it can't ship a half-written file.
+- A destination with `S3_SYNC_ON_BACKUP=false` and no schedule is never synced;
+  the hook logs a line saying so.
+- Cron specs are evaluated in the container's timezone, so set `TZ` if you care
+  about the exact hour. An unparseable spec fails the container at startup rather
+  than silently never syncing.
+- Scheduling needs the image's default command
+  (`/usr/local/bin/pg-backup-s3-entrypoint`). If you override `command:` /
+  `entrypoint:` in Compose, the schedulers never start and the hook warns about
+  it on the next backup.
+- To push on demand, regardless of schedules:
+  `docker compose exec pg-backup s3-sync --all` (or `--dest 2` for one bucket).
+
 ### Encryption (per destination)
 
 Encryption is **disabled by default**. Enable it per destination; when on, the
@@ -158,9 +224,18 @@ base image — see its documentation for the full list.
 
 ## How it works
 
-After each scheduled dump, the base image runs the bundled `post-backup` hook,
-which loops over every configured destination. For an unencrypted destination it
-mirrors the local layout directly:
+All the S3 logic lives in one script, `/usr/local/bin/s3-sync` (run
+`docker compose exec pg-backup s3-sync --help` to see its full reference, or
+`s3-sync --list` to print the destinations and how each one is triggered). It is
+driven from two places:
+
+- The bundled `post-backup` hook, which the base image runs after each dump. It
+  syncs every destination that has no schedule (`s3-sync --immediate`).
+- One `go-cron` scheduler per destination that has an `S3_SCHEDULE[_N]`, started
+  by the image's default command before it hands over to the base image's
+  `/init.sh`. Each scheduler runs `s3-sync --dest <id>` on its own cadence.
+
+For an unencrypted destination the sync mirrors the local layout directly:
 
 ```sh
 aws s3 sync "${BACKUP_DIR:-/backups}" "s3://${S3_BUCKET}/${S3_PREFIX:-pg-backups}" \
@@ -173,17 +248,29 @@ By default the sync runs with `--delete`, so the remote tracks local rotation
 (old backups removed locally are removed from S3 too). Set `S3_DELETE=false` (or
 `S3_DELETE_N=false`) to keep an append-only remote copy instead.
 
-For an encrypted destination the hook renders the current backup tree into a
-temporary staging directory (encrypting each file), then syncs that with the
-same flags so the remote stays in lockstep with local rotation and no stale
+For an encrypted destination the current backup tree is rendered into a
+temporary staging directory (encrypting each file), then synced with the same
+flags so the remote stays in lockstep with local rotation and no stale
 ciphertext is left behind. The staging directory is removed afterwards.
 
-Before syncing, the hook checks that `BACKUP_DIR` actually contains files and
+Before syncing, `s3-sync` checks that `BACKUP_DIR` actually contains files and
 skips the destination otherwise, so a `--delete` run can never wipe the remote
 copy from an empty source.
 
 Each destination runs in its own subshell, so credentials and flags never leak
-between targets. If any destination fails, the hook exits non-zero.
+between targets. If any destination fails, the run exits non-zero (which makes
+the base image treat that backup as failed and fire its `error` hooks).
+
+Two guards keep concurrent syncs honest, both using files under
+`S3_SYNC_STATE_DIR`:
+
+- a `flock` mutex, so a scheduled sync and a post-backup sync never upload at
+  the same time (a run that waits longer than `S3_SYNC_LOCK_WAIT` is skipped and
+  logged; the next run catches up)
+- a "dump in progress" marker written by the `pre-backup` hook and cleared by
+  the `post-backup` / `error` hooks, so a scheduled sync waits (up to
+  `S3_SYNC_BACKUP_WAIT`) for the dump to finish instead of shipping a
+  half-written file
 
 ## Restoring an encrypted backup
 
@@ -205,8 +292,9 @@ gunzip app-20240101.sql.gz
 
 ## Building
 
-The Dockerfile lives under `hooks/`, but the build context must be the parent
-directory so the `hooks/` folder is included:
+The Dockerfile lives under `hooks/`, but the build context must be the
+repository root so both `hooks/` (the run-parts hook) and `lib/` (`s3-sync` and
+the entrypoint wrapper) are included:
 
 ```bash
 docker build -f hooks/Dockerfile.pg-backup \

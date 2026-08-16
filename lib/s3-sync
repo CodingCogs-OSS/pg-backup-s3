@@ -1,0 +1,385 @@
+#!/bin/sh
+# s3-sync: ship the local backup tree to one or more S3 destinations,
+# optionally encrypting each destination's copy with a passphrase.
+#
+# Usage
+#   s3-sync [--immediate]    sync every destination that is synced right after a
+#                            backup (i.e. every destination without a schedule)
+#   s3-sync --all            sync every configured destination
+#   s3-sync --dest <id>      sync a single destination (id = "primary" or <n>)
+#   s3-sync --list           list destinations and how each one is triggered
+#   s3-sync --list-scheduled machine-readable list of scheduled destinations:
+#                            "<id> <on_start> <schedule>" per line
+#
+# Destinations
+#   #1 (primary) : S3_BUCKET, S3_PREFIX, S3_REGION, S3_ENDPOINT, S3_SSE,
+#                  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   #N (extra)   : the same names with a _N suffix, e.g. S3_BUCKET_2,
+#                  S3_ENDPOINT_2, AWS_SECRET_ACCESS_KEY_2. Per-destination
+#                  values that are empty fall back to the unsuffixed value.
+#
+#   S3_DELETE[_N]  true|false (default true): mirror local rotation by removing
+#                  remote objects that no longer exist locally. Set to false to
+#                  keep an append-only remote copy.
+#
+# Scheduling (per destination)
+#   S3_SCHEDULE[_N]        cron spec ("@daily", "0 4 * * 0", "@every 6h", ...).
+#                          When set, the destination is NOT synced right after
+#                          each backup; a scheduler runs it on its own cadence.
+#                          Use "none" to opt a destination out of an inherited
+#                          unsuffixed S3_SCHEDULE.
+#   S3_SYNC_ON_BACKUP[_N]  true|false. Defaults to true when the destination has
+#                          no schedule and to false when it has one.
+#   S3_SYNC_ON_START[_N]   true|false (default false): a scheduled destination
+#                          also syncs once shortly after container start.
+#
+# Encryption (per destination, disabled by default)
+#   ENCRYPTION_ENABLED[_N]     true|false    (default false)
+#   ENCRYPTION_METHOD[_N]      gpg|openssl   (default gpg)
+#   ENCRYPTION_PASSPHRASE[_N]  passphrase
+#
+# Secrets can be supplied indirectly with a *_FILE companion variable, e.g.
+#   AWS_SECRET_ACCESS_KEY_FILE, AWS_SECRET_ACCESS_KEY_2_FILE,
+#   ENCRYPTION_PASSPHRASE_FILE. (POSTGRES_PASSWORD_FILE is handled by the
+#   base image.)
+
+set -eu
+
+BACKUP_DIR="${BACKUP_DIR:-/backups}"
+STATE_DIR="${S3_SYNC_STATE_DIR:-/tmp/pg-backup-s3}"
+LOCK_FILE="$STATE_DIR/sync.lock"
+BACKUP_MARKER="$STATE_DIR/backup-in-progress"
+SCHEDULER_MARKER="$STATE_DIR/scheduler-active"
+# how long a sync waits for a lock held by another sync run before giving up
+LOCK_WAIT="${S3_SYNC_LOCK_WAIT:-1800}"
+# how long a scheduled sync waits for an in-flight dump to finish
+BACKUP_WAIT="${S3_SYNC_BACKUP_WAIT:-300}"
+
+log() { printf '[s3-sync] %s\n' "$*" >&2; }
+
+lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+
+is_true() {
+  case "$(lower "${1:-}")" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# value of ${BASE}${SFX}; if a suffixed lookup is empty, fall back to ${BASE}
+getval() {
+  _b="$1"; _s="$2"
+  eval "_v=\${${_b}${_s}:-}"
+  if [ -n "$_s" ] && [ -z "$_v" ]; then eval "_v=\${${_b}:-}"; fi
+  printf '%s' "$_v"
+}
+
+# like getval, but also honours a *_FILE companion that holds the value
+getsecret() {
+  _b="$1"; _s="$2"
+  eval "_v=\${${_b}${_s}:-}"
+  eval "_f=\${${_b}${_s}_FILE:-}"
+  if [ -z "$_v" ] && [ -n "$_f" ]; then _v=$(cat "$_f"); fi
+  if [ -n "$_s" ] && [ -z "$_v" ]; then
+    eval "_v=\${${_b}:-}"
+    eval "_f=\${${_b}_FILE:-}"
+    if [ -z "$_v" ] && [ -n "$_f" ]; then _v=$(cat "$_f"); fi
+  fi
+  printf '%s' "$_v"
+}
+
+# server-side-encryption value: an explicit setting always wins; otherwise
+# default to aws:kms for real AWS and to none when a custom endpoint is used
+get_sse() {
+  _s="$1"; _ep="$2"
+  eval "_set=\${S3_SSE${_s}+x}"
+  if [ "${_set:-}" = x ]; then eval "_v=\${S3_SSE${_s}}"; printf '%s' "$_v"; return; fi
+  if [ -n "$_s" ]; then
+    eval "_set=\${S3_SSE+x}"
+    if [ "${_set:-}" = x ]; then printf '%s' "${S3_SSE:-}"; return; fi
+  fi
+  if [ -n "$_ep" ]; then printf ''; else printf 'aws:kms'; fi
+}
+
+sfx_for() {
+  if [ "$1" = primary ]; then printf ''; else printf '_%s' "$1"; fi
+}
+
+# Enumerate destinations: primary (unsuffixed S3_BUCKET) plus any S3_BUCKET_<n>.
+list_dest_ids() {
+  _ids=""
+  [ -n "${S3_BUCKET:-}" ] && _ids="primary"
+  for _n in $(env | sed -n 's/^S3_BUCKET_\([0-9][0-9]*\)=.*/\1/p' | sort -n -u); do
+    _ids="$_ids $_n"
+  done
+  printf '%s' "$_ids"
+}
+
+# cron spec for a destination, empty when it should be synced after each backup
+get_schedule() {
+  _v=$(getval S3_SCHEDULE "$(sfx_for "$1")")
+  case "$(lower "$_v")" in
+    ''|none|off|no|false|disabled|-) printf '' ;;
+    *) printf '%s' "$_v" ;;
+  esac
+}
+
+# should this destination be synced right after a backup?
+syncs_on_backup() {
+  _s=$(sfx_for "$1")
+  _v=$(getval S3_SYNC_ON_BACKUP "$_s")
+  if [ -n "$_v" ]; then
+    is_true "$_v"
+    return $?
+  fi
+  # default: after every backup, unless the destination has its own schedule
+  [ -z "$(get_schedule "$1")" ]
+}
+
+encrypt_file() {
+  _m="$1"; _p="$2"; _in="$3"; _out="$4"
+  case "$_m" in
+    gpg)
+      printf '%s' "$_p" | gpg --batch --yes --pinentry-mode loopback \
+        --passphrase-fd 0 --cipher-algo AES256 --compress-algo none \
+        -o "$_out" -c "$_in" ;;
+    openssl)
+      ENC_PASS="$_p" openssl enc -aes-256-cbc -pbkdf2 -salt \
+        -pass env:ENC_PASS -in "$_in" -out "$_out" ;;
+    *)
+      log "unknown ENCRYPTION_METHOD '$_m'"; return 1 ;;
+  esac
+}
+
+ship_one() {
+  id="$1"
+  sfx=$(sfx_for "$id")
+
+  eval "bucket=\${S3_BUCKET${sfx}:-}"
+  if [ -z "$bucket" ]; then log "destination $id: no bucket set, skipping"; return 0; fi
+
+  # a sync only ever runs off a finished dump, so BACKUP_DIR should hold files;
+  # bail out if it is empty so a --delete sync can never wipe the remote copy
+  if [ -z "$(find "$BACKUP_DIR" -type f -print -quit 2>/dev/null)" ]; then
+    log "destination $id: nothing under $BACKUP_DIR to ship, skipping"
+    return 0
+  fi
+
+  prefix=$(getval S3_PREFIX "$sfx"); [ -n "$prefix" ] || prefix="pg-backups"
+  region=$(getval S3_REGION "$sfx"); [ -n "$region" ] || region="${AWS_DEFAULT_REGION:-}"
+  endpoint=$(getval S3_ENDPOINT "$sfx")
+  sse=$(get_sse "$sfx" "$endpoint")
+  akid=$(getsecret AWS_ACCESS_KEY_ID "$sfx")
+  asak=$(getsecret AWS_SECRET_ACCESS_KEY "$sfx")
+
+  [ -n "$akid" ] && export AWS_ACCESS_KEY_ID="$akid"
+  [ -n "$asak" ] && export AWS_SECRET_ACCESS_KEY="$asak"
+  [ -n "$region" ] && export AWS_DEFAULT_REGION="$region"
+
+  # --delete mirrors local rotation by default; S3_DELETE=false makes it append-only
+  want_delete=$(getval S3_DELETE "$sfx"); [ -n "$want_delete" ] || want_delete="true"
+
+  # build the shared aws flags as positional args (id is already saved above)
+  set --
+  [ -n "$endpoint" ] && set -- "$@" --endpoint-url "$endpoint"
+  [ -n "$sse" ] && set -- "$@" --sse "$sse"
+  is_true "$want_delete" && set -- "$@" --delete
+
+  target="s3://${bucket}/${prefix}"
+
+  if is_true "$(getval ENCRYPTION_ENABLED "$sfx")"; then
+    method=$(getval ENCRYPTION_METHOD "$sfx"); [ -n "$method" ] || method="gpg"
+    pass=$(getsecret ENCRYPTION_PASSPHRASE "$sfx")
+    if [ -z "$pass" ]; then
+      log "destination $id: encryption enabled but no passphrase configured"
+      return 1
+    fi
+    case "$method" in
+      gpg) ext=".gpg" ;;
+      openssl) ext=".enc" ;;
+      *) log "destination $id: unknown ENCRYPTION_METHOD '$method'"; return 1 ;;
+    esac
+
+    stage=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$stage\"" EXIT INT TERM
+
+    filelist=$(mktemp)
+    find "$BACKUP_DIR" -type f > "$filelist"
+    while IFS= read -r src; do
+      rel=${src#"$BACKUP_DIR"/}
+      out="$stage/$rel$ext"
+      mkdir -p "$(dirname "$out")"
+      encrypt_file "$method" "$pass" "$src" "$out"
+    done < "$filelist"
+    rm -f "$filelist"
+
+    log "destination $id: syncing encrypted ($method) backups to $target"
+    # staging is a full re-render of the current backup tree, so a --delete sync
+    # (the default) keeps the remote in lockstep with local rotation; leaving
+    # --delete off (S3_DELETE=false) makes the remote accumulate ciphertext
+    aws s3 sync "$stage" "$target" "$@" --only-show-errors
+
+    rm -rf "$stage"
+    trap - EXIT INT TERM
+  else
+    log "destination $id: syncing backups to $target"
+    aws s3 sync "$BACKUP_DIR" "$target" "$@" --only-show-errors
+  fi
+}
+
+# Run every destination in its own subshell so per-destination credentials and
+# flags never leak between targets; report failure if any destination fails.
+ship_many() {
+  _rc=0
+  for _id in "$@"; do
+    if ! ( ship_one "$_id" ); then
+      log "destination $_id: FAILED"
+      _rc=1
+    fi
+  done
+  return $_rc
+}
+
+# Serialize sync runs so a scheduled destination and a post-backup sync (or two
+# scheduled destinations whose cron specs collide) never push at the same time.
+with_lock() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if ! command -v flock >/dev/null 2>&1 || ! : >>"$LOCK_FILE" 2>/dev/null; then
+    log "warning: no usable lock ($LOCK_FILE); running without one"
+    "$@"
+    return $?
+  fi
+  exec 9>>"$LOCK_FILE"
+  if ! flock -w "$LOCK_WAIT" 9; then
+    log "another sync still holds the lock after ${LOCK_WAIT}s, skipping this run"
+    exec 9>&-
+    return 0
+  fi
+  _rc=0
+  "$@" || _rc=$?
+  exec 9>&-
+  return $_rc
+}
+
+# A scheduled sync can fire while a dump is being written. Wait for the dump to
+# finish so we don't upload a half-written file.
+wait_for_backup() {
+  [ -e "$BACKUP_MARKER" ] || return 0
+  log "a backup is in progress, waiting up to ${BACKUP_WAIT}s for it to finish"
+  _waited=0
+  while [ -e "$BACKUP_MARKER" ] && [ "$_waited" -lt "$BACKUP_WAIT" ]; do
+    sleep 5
+    _waited=$((_waited + 5))
+  done
+  if [ -e "$BACKUP_MARKER" ]; then
+    log "warning: backup still in progress after ${BACKUP_WAIT}s, syncing anyway"
+  fi
+}
+
+usage() {
+  awk 'NR==1 && /^#!/ { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  exit "${1:-0}"
+}
+
+mode="immediate"
+want=""
+case "${1:---immediate}" in
+  --immediate) ;;
+  --all) mode="all" ;;
+  --dest)
+    mode="dest"
+    want="${2:-}"
+    [ -n "$want" ] || { log "--dest needs a destination id"; exit 2; }
+    ;;
+  --list) mode="list" ;;
+  --list-scheduled) mode="list-scheduled" ;;
+  -h|--help) usage 0 ;;
+  *) log "unknown argument '$1'"; usage 2 ;;
+esac
+
+dest_ids=$(list_dest_ids)
+
+if [ -z "$dest_ids" ]; then
+  case "$mode" in
+    list|list-scheduled) exit 0 ;;
+    *) log "no S3 destination configured (set S3_BUCKET and/or S3_BUCKET_<n>)"; exit 1 ;;
+  esac
+fi
+
+case "$mode" in
+  list)
+    for id in $dest_ids; do
+      sched=$(get_schedule "$id")
+      if syncs_on_backup "$id"; then trig="after-backup"; else trig="-"; fi
+      if [ -n "$sched" ]; then trig="$trig schedule=\"$sched\""; fi
+      eval "b=\${S3_BUCKET$(sfx_for "$id"):-}"
+      printf '%s\t%s\t%s\n' "$id" "$b" "$trig"
+    done
+    ;;
+
+  list-scheduled)
+    for id in $dest_ids; do
+      sched=$(get_schedule "$id")
+      [ -n "$sched" ] || continue
+      if is_true "$(getval S3_SYNC_ON_START "$(sfx_for "$id")")"; then
+        on_start="true"
+      else
+        on_start="false"
+      fi
+      printf '%s %s %s\n' "$id" "$on_start" "$sched"
+    done
+    ;;
+
+  dest)
+    matched=""
+    for id in $dest_ids; do
+      [ "$id" = "$want" ] && matched="$id"
+    done
+    if [ -z "$matched" ]; then
+      log "destination '$want' is not configured"
+      exit 1
+    fi
+    wait_for_backup
+    with_lock ship_many "$matched"
+    ;;
+
+  all)
+    with_lock ship_many $dest_ids
+    ;;
+
+  immediate)
+    due=""
+    deferred=""
+    for id in $dest_ids; do
+      if syncs_on_backup "$id"; then
+        due="$due $id"
+      else
+        deferred="$deferred $id"
+        sched=$(get_schedule "$id")
+        if [ -n "$sched" ]; then
+          log "destination $id: not synced now, scheduled ($sched)"
+        else
+          log "destination $id: sync-on-backup disabled and no schedule set, skipping"
+        fi
+      fi
+    done
+
+    if [ -n "$deferred" ] && [ ! -e "$SCHEDULER_MARKER" ]; then
+      for id in $deferred; do
+        if [ -n "$(get_schedule "$id")" ]; then
+          log "warning: scheduled destinations exist but no sync scheduler is running."
+          log "warning: the image must start via pg-backup-s3-entrypoint (its default"
+          log "warning: command) for S3_SCHEDULE to take effect."
+          break
+        fi
+      done
+    fi
+
+    if [ -z "$due" ]; then
+      log "no destination is due for an after-backup sync"
+      exit 0
+    fi
+    with_lock ship_many $due
+    ;;
+esac

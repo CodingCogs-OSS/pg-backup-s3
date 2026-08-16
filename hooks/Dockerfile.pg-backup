@@ -3,11 +3,12 @@
 FROM prodrigestivill/postgres-backup-local:17
 
 # AWS CLI v2 for shipping dumps to S3 from the post-backup hook, plus gnupg and
-# openssl for the optional password-based backup encryption.
+# openssl for the optional password-based backup encryption and util-linux for
+# flock (serializes scheduled syncs against post-backup syncs).
 # Base image is Debian, so install AWS CLI via the official installer (arch-aware).
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends curl unzip ca-certificates gnupg openssl; \
+    apt-get install -y --no-install-recommends curl unzip ca-certificates gnupg openssl util-linux; \
     case "$(uname -m)" in \
       x86_64)  awscli_arch="x86_64" ;; \
       aarch64) awscli_arch="aarch64" ;; \
@@ -19,7 +20,22 @@ RUN set -eux; \
     rm -rf /tmp/aws /tmp/awscliv2.zip; \
     apt-get purge -y --auto-remove unzip; \
     rm -rf /var/lib/apt/lists/*; \
-    aws --version
+    aws --version; \
+    flock --version
 
+# s3-sync holds all the S3/encryption/scheduling logic; the entrypoint wrapper
+# starts one cron scheduler per destination that has its own S3_SCHEDULE and
+# then hands over to the base image's /init.sh.
+COPY lib/s3-sync lib/pg-backup-s3-entrypoint /usr/local/bin/
 COPY hooks/ /hooks/
-RUN chmod +x /hooks/*
+# Strip any CR so a CRLF-saved script can't make the kernel read the shebang as
+# "/bin/sh\r" (which fails with "No such file or directory"), then mark exec.
+RUN set -eux; \
+    sed -i 's/\r$//' /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
+    chmod +x /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
+    rm -f /hooks/Dockerfile.pg-backup; \
+    sh -n /usr/local/bin/s3-sync; \
+    sh -n /usr/local/bin/pg-backup-s3-entrypoint; \
+    sh -n /hooks/post-backup
+
+CMD ["/usr/local/bin/pg-backup-s3-entrypoint"]

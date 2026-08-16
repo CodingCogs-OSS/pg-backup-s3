@@ -1,0 +1,6 @@
+# The image only needs the hooks/ and lib/ trees (COPY hooks/ /hooks/ and
+# COPY lib/... /usr/local/bin/). Keep the build context small and avoid leaking
+# repo/deploy files into the image.
+*
+!hooks
+!lib

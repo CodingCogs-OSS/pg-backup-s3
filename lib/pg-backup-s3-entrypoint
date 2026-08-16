@@ -1,0 +1,97 @@
+#!/bin/sh
+# pg-backup-s3-entrypoint: default command of the image.
+#
+# Starts one lightweight cron scheduler per S3 destination that has its own
+# S3_SCHEDULE[_N], then hands over to the base image's /init.sh (which schedules
+# the dumps themselves). Destinations without a schedule are still synced by the
+# post-backup hook right after each dump.
+#
+#   S3_SYNC_SCHEDULER=false   don't start the per-destination schedulers at all
+#   S3_SYNC_STATE_DIR         where the lock/marker files live (default
+#                             /tmp/pg-backup-s3)
+
+set -eu
+
+STATE_DIR="${S3_SYNC_STATE_DIR:-/tmp/pg-backup-s3}"
+SCHEDULER_MARKER="$STATE_DIR/scheduler-active"
+S3_SYNC_BIN="${S3_SYNC_BIN:-/usr/local/bin/s3-sync}"
+GO_CRON_BIN="${GO_CRON_BIN:-/usr/local/bin/go-cron}"
+
+log() { printf '[pg-backup-s3] %s\n' "$*" >&2; }
+
+is_true() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# go-cron accepts robfig/cron specs: 5 fields, 6 with optional leading seconds,
+# or a descriptor (@daily, @every 6h, ...). It silently ignores a spec it cannot
+# parse, which would mean "never syncs", so reject bad specs loudly up front.
+valid_schedule() {
+  case "$1" in
+    "@every "*)
+      [ -n "$(printf '%s' "${1#@every }" | tr -d '[:space:]')" ] ;;
+    @annually|@yearly|@monthly|@weekly|@daily|@midnight|@hourly)
+      : ;;
+    @*)
+      return 1 ;;
+    *)
+      # -f so that the "*" fields of a cron spec are not glob-expanded
+      set -f
+      # shellcheck disable=SC2086
+      set -- $1
+      _n="$#"
+      set +f
+      [ "$_n" -ge 5 ] && [ "$_n" -le 6 ] ;;
+  esac
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || log "warning: cannot create state dir $STATE_DIR"
+rm -f "$SCHEDULER_MARKER" 2>/dev/null || true
+# a marker left behind by a previous run of this container would be misleading
+rm -f "$STATE_DIR/backup-in-progress" 2>/dev/null || true
+
+if [ -x "$S3_SYNC_BIN" ]; then
+  "$S3_SYNC_BIN" --list | while IFS="$(printf '\t')" read -r id bucket trigger; do
+    log "destination $id: bucket=$bucket $trigger"
+  done || true
+fi
+
+scheduled=""
+if is_true "${S3_SYNC_SCHEDULER:-true}" && [ -x "$S3_SYNC_BIN" ]; then
+  scheduled=$("$S3_SYNC_BIN" --list-scheduled) || scheduled=""
+fi
+
+if [ -n "$scheduled" ]; then
+  if [ ! -x "$GO_CRON_BIN" ]; then
+    log "S3_SCHEDULE is set but $GO_CRON_BIN is missing; cannot schedule syncs"
+    exit 1
+  fi
+
+  started=0
+  # read from a here-doc so the loop runs in this shell and can start jobs
+  while read -r id on_start schedule; do
+    [ -n "${id:-}" ] || continue
+    if ! valid_schedule "$schedule"; then
+      log "destination $id: invalid S3_SCHEDULE '$schedule' (expected a 5/6 field"
+      log "destination $id: cron spec or a descriptor like @daily / @every 6h)"
+      exit 1
+    fi
+    if is_true "$on_start"; then init_arg="-i"; else init_arg=""; fi
+    log "destination $id: scheduling S3 sync on '$schedule'${init_arg:+ (plus once on start)}"
+    # -p 0 keeps these schedulers off the healthcheck port used by /init.sh
+    "$GO_CRON_BIN" -p 0 -s "$schedule" $init_arg -- "$S3_SYNC_BIN" --dest "$id" &
+    started=$((started + 1))
+  done <<EOF
+$scheduled
+EOF
+
+  if [ "$started" -gt 0 ]; then
+    : >"$SCHEDULER_MARKER" 2>/dev/null || true
+  fi
+fi
+
+log "starting backup scheduler (SCHEDULE=${SCHEDULE:-unset})"
+exec /init.sh

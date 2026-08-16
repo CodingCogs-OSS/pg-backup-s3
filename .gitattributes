@@ -1,0 +1,7 @@
+# Hook and helper scripts run inside a Linux container and MUST use LF line
+# endings, otherwise the kernel reads the shebang as "/bin/sh\r" and run-parts
+# fails with "No such file or directory".
+hooks/post-backup text eol=lf
+hooks/* text eol=lf
+lib/* text eol=lf
+*.sh text eol=lf

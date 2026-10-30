@@ -1,8 +1,8 @@
 #!/bin/sh
-# post-backup hook for prodrigestivill/postgres-backup-local.
+# run-parts hook shipped in both images (pg-backup-s3 and mongo-backup-s3).
 #
-# The base image runs every script in /hooks with run-parts, passing the action
-# as $1 ("pre-backup", "post-backup" or "error"), so this one script handles all
+# Each image's /backup.sh runs every script in /hooks with run-parts, passing the
+# action as $1 ("pre-backup", "post-backup" or "error"), so this one script handles all
 # three:
 #
 #   pre-backup   flag that a dump is being written, so a scheduled S3 sync does
@@ -47,7 +47,7 @@ case "${1:-post-backup}" in
     ;;
 
   *)
-    # unknown action from a future base image: nothing to do
+    # unknown action: nothing to do
     exit 0
     ;;
 esac

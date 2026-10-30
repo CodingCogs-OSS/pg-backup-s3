@@ -1,0 +1,51 @@
+#!/bin/sh
+# Webhook hook for pg-backup-s3 (run-parts passes the action as $1).
+#
+#   WEBHOOK_URL               called on post-backup and on error
+#   WEBHOOK_PRE_BACKUP_URL    called on pre-backup
+#   WEBHOOK_POST_BACKUP_URL   called on post-backup
+#   WEBHOOK_ERROR_URL         called on error
+#   WEBHOOK_EXTRA_ARGS        extra curl arguments (split on whitespace)
+#
+# Each call POSTs {"status": "<action>"} as JSON. Empty, unset or "**None**"
+# disables a URL. The URL goes to curl on stdin (--config -) and is never
+# logged, so tokens inside it stay out of ps and the logs. The exit status is
+# curl's status for the last call of the action, as in postgres-backup-local.
+#
+# Ported from prodrigestivill/docker-postgres-backup-local (MIT License,
+# Copyright (c) 2023 Pau Rodriguez-Estivill and Johannes Schickling); see
+# lib/pg/NOTICE (/usr/share/doc/pg-backup-s3/NOTICE.postgres-backup-local).
+set -u
+_none() { [ -z "${1:-}" ] || [ "$1" = '**None**' ]; }
+
+# POST {"status": "<status>"} to the URL in variable $1; returns curl's status
+call_webhook() {
+  eval "_url=\${$1:-}"
+  # shellcheck disable=SC2154  # assigned by the eval above
+  _none "$_url" && return 0
+  printf '[webhook] calling %s (%s)\n' "$1" "$2" >&2
+  # curl config syntax: escape backslashes and double quotes
+  _esc=$(printf '%s' "$_url" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  set -f
+  # shellcheck disable=SC2086
+  printf 'url = "%s"\n' "$_esc" | curl --config - --request POST \
+    --header 'Content-Type: application/json' \
+    --data "{\"status\": \"$2\"}" \
+    --max-time 10 --retry 5 ${WEBHOOK_EXTRA_ARGS:-}
+  _rc=$?
+  set +f
+  return "$_rc"
+}
+
+# exit status = status of the last call in the branch, like upstream
+case "${1:-}" in
+  error)
+    call_webhook WEBHOOK_URL error
+    call_webhook WEBHOOK_ERROR_URL error ;;
+  pre-backup)
+    call_webhook WEBHOOK_PRE_BACKUP_URL pre-backup ;;
+  post-backup)
+    call_webhook WEBHOOK_URL post-backup
+    call_webhook WEBHOOK_POST_BACKUP_URL post-backup ;;
+  *) : ;;
+esac

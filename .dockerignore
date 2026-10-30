@@ -1,6 +1,7 @@
-# The image only needs the hooks/ and lib/ trees (COPY hooks/ /hooks/ and
-# COPY lib/... /usr/local/bin/). Keep the build context small and avoid leaking
-# repo/deploy files into the image.
+# The images only need the hooks/, lib/ and docker/keys/ trees (COPY hooks/ /hooks/,
+# COPY lib/... /usr/local/bin/, COPY docker/keys/...). Keep the build context
+# small and avoid leaking repo/deploy files into the image.
 *
 !hooks
 !lib
+!docker/keys

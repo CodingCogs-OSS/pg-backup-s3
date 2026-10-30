@@ -1,0 +1,204 @@
+name: images
+
+on:
+  schedule:
+    # 03:17 and 15:17 UTC. GitHub disables this after 60 days without
+    # repository activity; see README "CI and publishing".
+    - cron: "17 3,15 * * *"
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GRYPE_IMAGE: anchore/grype:v0.121.0@sha256:621d56d1d68106b787022c81546f7e0a36202a25d1239f0c20195fab8c16f7ea
+  TEST_IMAGE: ci.local/image:test
+
+jobs:
+  prepare:
+    name: Prepare matrix and tags
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # checkout
+    outputs:
+      publish: ${{ steps.matrix.outputs.publish }}
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+      publish_matrix: ${{ steps.matrix.outputs.publish_matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compute matrix
+        id: matrix
+        run: sh scripts/ci-matrix.sh >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.kind }} ${{ matrix.variant }} ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read # checkout
+      security-events: write # upload Grype SARIF to code scanning
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
+    env:
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      KIND: ${{ matrix.kind }}
+      REPO: ${{ matrix.repo }}
+      TESTS: ${{ matrix.tests }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+      - name: Build (no publish)
+        if: needs.prepare.outputs.publish != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: ${{ matrix.build_args }}
+          pull: true
+          no-cache: true
+          load: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.TEST_IMAGE }}
+      - name: Build and push by digest
+        id: push
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: ${{ matrix.build_args }}
+          pull: true
+          no-cache: true
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ matrix.repo }},push-by-digest=true,name-canonical=true,push=true
+      - name: Pull the pushed digest for testing
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          docker pull "$REPO@$DIGEST"
+          docker tag "$REPO@$DIGEST" "$TEST_IMAGE"
+      - name: End-to-end tests
+        run: |
+          # TESTS is a space-separated list; splitting is intended
+          # shellcheck disable=SC2086
+          for v in $TESTS; do
+            sh tests/e2e.sh "$KIND" "$TEST_IMAGE" "$v"
+          done
+      - name: Grype scan
+        id: scan
+        continue-on-error: ${{ github.event_name == 'schedule' }}
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            # the pushed and tested digest, straight from the (public) registry;
+            # avoids docker save on a pulled multi-platform index
+            set -- "registry:$REPO@$DIGEST" --platform "linux/$ARCH"
+          else
+            docker save "$TEST_IMAGE" -o image.tar
+            set -- docker-archive:/work/image.tar
+          fi
+          docker run --rm -v "$PWD:/work" -w /work "$GRYPE_IMAGE" "$@" \
+            --config /work/.grype.yaml --only-fixed --fail-on high \
+            -o table -o sarif=/work/grype.sarif
+      - name: Record the tested digest
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH"
+      - name: Upload the tested digest
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload Grype SARIF
+        if: always() && hashFiles('grype.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: grype.sarif
+          category: grype-${{ matrix.kind }}-${{ matrix.variant }}-${{ matrix.arch }}
+      - name: Fail the scheduled run on new fixable findings
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::Grype found fixable Critical/High findings that are not in .grype.yaml (the scheduled build was still published)"
+          exit 1
+
+  publish:
+    name: publish ${{ matrix.variant }}
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read # download this run's digest artifacts
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.publish_matrix) }}
+    env:
+      REPO: ${{ matrix.repo }}
+      TAGS: ${{ matrix.tags }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Download tested digests
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-${{ matrix.variant }}-*
+          path: digests
+          merge-multiple: true
+      - name: Require a tested digest for every architecture
+        run: |
+          for a in amd64 arm64; do
+            if [ ! -s "digests/$a" ]; then
+              echo "::error::$VARIANT: no tested $a digest (build, test or scan failed); not publishing"
+              exit 1
+            fi
+          done
+      - name: Log in to Docker Hub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create the multi-arch manifest and tags
+        run: |
+          set --
+          # TAGS is a space-separated list; splitting is intended
+          # shellcheck disable=SC2086
+          for t in $TAGS; do set -- "$@" --tag "$REPO:$t"; done
+          docker buildx imagetools create "$@" "$REPO@$(cat digests/amd64)" "$REPO@$(cat digests/arm64)"
+      - name: Inspect
+        run: docker buildx imagetools inspect "$REPO:${TAGS%% *}"

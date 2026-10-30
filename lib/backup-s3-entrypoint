@@ -34,9 +34,15 @@ is_true() {
 # or a descriptor (@daily, @every 6h, ...). It silently ignores a spec it cannot
 # parse, which would mean "never syncs", so reject bad specs loudly up front.
 valid_schedule() {
-  case "$1" in
+  _spec="$1"
+  # robfig/cron accepts an optional leading CRON_TZ=<zone> or TZ=<zone> token
+  case "$_spec" in
+    CRON_TZ=*|TZ=*)
+      case "$_spec" in *" "*) _spec="${_spec#* }" ;; *) return 1 ;; esac ;;
+  esac
+  case "$_spec" in
     "@every "*)
-      [ -n "$(printf '%s' "${1#@every }" | tr -d '[:space:]')" ] ;;
+      [ -n "$(printf '%s' "${_spec#@every }" | tr -d '[:space:]')" ] ;;
     @annually|@yearly|@monthly|@weekly|@daily|@midnight|@hourly)
       : ;;
     @*)
@@ -45,7 +51,7 @@ valid_schedule() {
       # -f so that the "*" fields of a cron spec are not glob-expanded
       set -f
       # shellcheck disable=SC2086
-      set -- $1
+      set -- $_spec
       _n="$#"
       set +f
       [ "$_n" -ge 5 ] && [ "$_n" -le 6 ] ;;

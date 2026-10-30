@@ -1,41 +1,161 @@
-# Match the tag to your Postgres MAJOR version (your server is postgres:17-alpine),
-# so pg_dump is compatible with the server.
-FROM prodrigestivill/postgres-backup-local:17
+# pg-backup-s3: scheduled pg_dump backups, environment-compatible with
+# prodrigestivill/postgres-backup-local, shipped to one or more S3 destinations.
+#
+# Build from the repository root (the context needs hooks/, lib/ and docker/keys/).
+# PG_MAJOR is required; the supported majors are listed in docker/versions.env:
+#   docker build -f docker/Dockerfile.pg-backup --build-arg PG_MAJOR=18 -t cc0funobit/pg-backup-s3:18 .
+#   sh scripts/build.sh pg          # every major in docker/versions.env
 
-# AWS CLI v2 for shipping dumps to S3 from the post-backup hook, plus gnupg and
-# openssl for the optional password-based backup encryption and util-linux for
-# flock (serializes scheduled syncs against post-backup syncs).
-# Base image is Debian, so install AWS CLI via the official installer (arch-aware).
+ARG BASE_IMAGE=ubuntu:24.04
+# golang:<GO_VERSION>-bookworm: patch releases arrive with --pull; bump the minor
+# by hand. Bookworm's glibc (2.36) is older than Ubuntu 24.04's, so cgo builds
+# made here also run on the runtime image.
+ARG GO_VERSION=1.27
+
+# ---- go-cron (keep this stage identical in both Dockerfiles) ----
+# Same prodrigestivill/go-cron release as postgres-backup-local, so SCHEDULE and
+# S3_SCHEDULE syntax is unchanged; built from source with the current Go and
+# cross-compiled on the build platform (no Go under QEMU).
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-cron
+ARG GOCRONVER=v0.0.11
+ARG GOCRON_COMMIT=4e5a8e635e2a493aa4e49a8db23294ce4325cffd
+ARG TARGETOS
+ARG TARGETARCH
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends curl unzip ca-certificates gnupg openssl util-linux; \
-    case "$(uname -m)" in \
-      x86_64)  awscli_arch="x86_64" ;; \
-      aarch64) awscli_arch="aarch64" ;; \
-      *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip; \
-    unzip -q /tmp/awscliv2.zip -d /tmp; \
-    /tmp/aws/install; \
-    rm -rf /tmp/aws /tmp/awscliv2.zip; \
-    apt-get purge -y --auto-remove unzip; \
-    rm -rf /var/lib/apt/lists/*; \
-    aws --version; \
-    flock --version
+    git clone --quiet --depth 1 --branch "$GOCRONVER" https://github.com/prodrigestivill/go-cron.git /src; \
+    cd /src; \
+    test "$(git rev-parse HEAD)" = "$GOCRON_COMMIT"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$TARGETARCH" GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+      go build -trimpath -ldflags "-s -w -X main.version=$GOCRONVER -X main.build=$GOCRON_COMMIT" -o /out/go-cron .
 
-# s3-sync holds all the S3/encryption/scheduling logic; the entrypoint wrapper
-# starts one cron scheduler per destination that has its own S3_SCHEDULE and
-# then hands over to the base image's /init.sh.
+# ---- AWS CLI v2 (keep this stage identical in both Dockerfiles) ----
+# Latest release at build time, PGP-verified against the AWS CLI Team key
+# (fingerprint from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
+FROM ${BASE_IMAGE} AS awscli
+ARG TARGETARCH
+ARG DEBIAN_FRONTEND=noninteractive
+ARG AWSCLI_KEY_FPR=FB5DB77FD5C118B80511ADA8A6310ACC4672475C
+# CA bundle so apt can use HTTPS before the ca-certificates package is installed
+COPY --from=go-cron /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY docker/keys/aws-cli.asc /tmp/aws-cli.asc
+RUN set -eux; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl unzip gpg gpg-agent; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+      amd64) awscli_arch=x86_64 ;; \
+      arm64) awscli_arch=aarch64 ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip"; \
+    curl -fsSL --retry 4 -o /tmp/awscliv2.zip "$url"; \
+    curl -fsSL --retry 4 -o /tmp/awscliv2.zip.sig "$url.sig"; \
+    GNUPGHOME="$(mktemp -d)"; export GNUPGHOME; \
+    gpg --batch --quiet --import /tmp/aws-cli.asc; \
+    signer=$(gpg --batch --status-fd 1 --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip 2>/dev/null | awk '$2 == "VALIDSIG" { print $NF }'); \
+    test "$signer" = "$AWSCLI_KEY_FPR"; \
+    unzip -q /tmp/awscliv2.zip -d /tmp; \
+    /tmp/aws/install --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin; \
+    /usr/local/bin/aws --version
+
+FROM ${BASE_IMAGE}
+ARG PG_MAJOR
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PGDG_KEY_FPR=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+COPY --from=go-cron /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY docker/keys/pgdg.asc /usr/share/keyrings/pgdg.asc
+# postgresql-client-<major> from the PGDG repo (apt.postgresql.org), plus curl
+# (webhooks, healthcheck), gpg/gpg-agent and openssl (encryption) and tzdata
+# (TZ for cron schedules). flock (util-linux) and run-parts are in the base.
+# uid/gid 999 "postgres" keeps upstream's recommended -u postgres:postgres working.
+RUN set -eux; \
+    test -n "${PG_MAJOR:-}" || { echo "build arg PG_MAJOR is required (see docker/versions.env)" >&2; exit 1; }; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    groupadd --system --gid 999 postgres; \
+    useradd --system --uid 999 --gid postgres --home-dir /var/lib/postgresql --no-create-home --shell /usr/sbin/nologin postgres; \
+    apt-get update; \
+    apt-get upgrade -y; \
+    apt-get install -y --no-install-recommends ca-certificates curl gpg gpg-agent openssl tzdata; \
+    tmp_gnupg="$(mktemp -d)"; \
+    fpr=$(GNUPGHOME="$tmp_gnupg" gpg --batch --show-keys --with-colons /usr/share/keyrings/pgdg.asc | awk -F: '$1 == "fpr" { print $10; exit }'); \
+    rm -rf "$tmp_gnupg"; \
+    test "$fpr" = "$PGDG_KEY_FPR"; \
+    . /etc/os-release; \
+    printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: %s-pgdg\nComponents: main\nSigned-By: /usr/share/keyrings/pgdg.asc\n' "$VERSION_CODENAME" > /etc/apt/sources.list.d/pgdg.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "postgresql-client-$PG_MAJOR"; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PG_MAJOR=${PG_MAJOR}
+# call pg_dump/pg_dumpall/psql directly, not through Debian's pg_wrapper
+ENV PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH
+
+# Environment-compatible with prodrigestivill/postgres-backup-local.
+ENV POSTGRES_DB="**None**" \
+    POSTGRES_DB_FILE="**None**" \
+    POSTGRES_HOST="**None**" \
+    POSTGRES_PORT=5432 \
+    POSTGRES_USER="**None**" \
+    POSTGRES_USER_FILE="**None**" \
+    POSTGRES_PASSWORD="**None**" \
+    POSTGRES_PASSWORD_FILE="**None**" \
+    POSTGRES_PASSFILE_STORE="**None**" \
+    POSTGRES_EXTRA_OPTS="-Z1" \
+    POSTGRES_CLUSTER="FALSE" \
+    SCHEDULE="@daily" \
+    VALIDATE_ON_START="TRUE" \
+    BACKUP_ON_START="FALSE" \
+    BACKUP_DIR="/backups" \
+    BACKUP_SUFFIX=".sql.gz" \
+    BACKUP_LATEST_TYPE="symlink" \
+    BACKUP_KEEP_DAYS=7 \
+    BACKUP_KEEP_WEEKS=4 \
+    BACKUP_KEEP_MONTHS=6 \
+    BACKUP_KEEP_MINS=1440 \
+    HEALTHCHECK_PORT=8080 \
+    WEBHOOK_URL="**None**" \
+    WEBHOOK_ERROR_URL="**None**" \
+    WEBHOOK_PRE_BACKUP_URL="**None**" \
+    WEBHOOK_POST_BACKUP_URL="**None**" \
+    WEBHOOK_EXTRA_ARGS=""
+
+COPY --from=go-cron /out/go-cron /usr/local/bin/go-cron
+COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
 COPY lib/s3-sync /usr/local/bin/s3-sync
 COPY lib/backup-s3-entrypoint /usr/local/bin/pg-backup-s3-entrypoint
+COPY lib/pg/init.sh /init.sh
+COPY lib/pg/env.sh /env.sh
+COPY lib/pg/backup.sh /backup.sh
 COPY hooks/ /hooks/
+COPY lib/pg/hooks/00-webhook /hooks/00-webhook
+COPY lib/pg/NOTICE /usr/share/doc/pg-backup-s3/NOTICE.postgres-backup-local
 # Strip any CR so a CRLF-saved script can't make the kernel read the shebang as
-# "/bin/sh\r" (which fails with "No such file or directory"), then mark exec.
+# "/bin/sh\r", mark the scripts executable and check their syntax with dash.
 RUN set -eux; \
-    sed -i 's/\r$//' /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
-    chmod +x /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
+    ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws; \
+    sed -i 's/\r$//' /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint /init.sh /env.sh /backup.sh; \
+    chmod +x /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint /init.sh /env.sh /backup.sh; \
     sh -n /usr/local/bin/s3-sync; \
     sh -n /usr/local/bin/pg-backup-s3-entrypoint; \
-    sh -n /hooks/post-backup
+    sh -n /init.sh; \
+    sh -n /env.sh; \
+    sh -n /backup.sh; \
+    sh -n /hooks/post-backup; \
+    sh -n /hooks/00-webhook; \
+    test "$(run-parts --test /hooks | tr '\n' ' ')" = "/hooks/00-webhook /hooks/post-backup "; \
+    test -x /usr/local/bin/go-cron; \
+    mkdir -p /backups; \
+    aws --version; \
+    flock --version; \
+    pg_dump --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."
+
+VOLUME /backups
+
+# go-cron's status endpoint: unauthenticated, so don't publish this port.
+HEALTHCHECK --interval=5m --timeout=3s \
+  CMD curl -f "http://localhost:$HEALTHCHECK_PORT/" || exit 1
 
 CMD ["/usr/local/bin/pg-backup-s3-entrypoint"]

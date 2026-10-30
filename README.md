@@ -1,32 +1,51 @@
 # pg-backup-s3 / mongo-backup-s3
-
 [![Docker Hub](https://img.shields.io/docker/pulls/cc0funobit/pg-backup-s3?logo=docker&label=Docker%20Hub)](https://hub.docker.com/r/cc0funobit/pg-backup-s3)
-[![Image Size](https://img.shields.io/docker/image-size/cc0funobit/pg-backup-s3/17?logo=docker&label=image%20size)](https://hub.docker.com/r/cc0funobit/pg-backup-s3)
+[![Image Size](https://img.shields.io/docker/image-size/cc0funobit/pg-backup-s3/latest?logo=docker&label=image%20size)](https://hub.docker.com/r/cc0funobit/pg-backup-s3)
 [![Docker Hub](https://img.shields.io/docker/pulls/cc0funobit/mongo-backup-s3?logo=docker&label=mongo-backup-s3)](https://hub.docker.com/r/cc0funobit/mongo-backup-s3)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 This repository builds two images that share the same S3 layer (multi-destination
-fan-out, per-destination schedules, encryption):
+fan-out, per-destination schedules, encryption). Both are built on
+`ubuntu:24.04` and rebuilt, tested and scanned twice a day
+(see [CI and publishing](#ci-and-publishing)).
 
-| Image                              | Database        | Dockerfile                      |
-|------------------------------------|-----------------|---------------------------------|
-| `cc0funobit/pg-backup-s3:17`       | PostgreSQL 17   | `docker/Dockerfile.pg-backup`   |
-| `cc0funobit/mongo-backup-s3:8.0`   | MongoDB 8.0     | `docker/Dockerfile.mongo-backup`|
+## Images and tags
+
+| Image                          | Database                         | Tags                                              | Dockerfile                       |
+|--------------------------------|----------------------------------|---------------------------------------------------|----------------------------------|
+| `cc0funobit/pg-backup-s3`      | PostgreSQL 14, 15, 16, 17, 18    | `14`, `15`, `16`, `17`, `18`, `latest` (= 18)     | `docker/Dockerfile.pg-backup`    |
+| `cc0funobit/mongo-backup-s3`   | MongoDB 7.0, 8.0, 8.3, 9.0       | `7.0`, `8.0`, `8.3`, `9.0`, `latest` (= 9.0)      | `docker/Dockerfile.mongo-backup` |
+
+- **Pin the tag that matches your server.** The `pg_dump` major version should match
+  the server's major version, so use `pg-backup-s3:17` for a PostgreSQL 17 server.
+  `pg-backup-s3:latest` moved from PostgreSQL 17 to **18**; if you used `latest`
+  with a 17 server, switch to `:17`.
+- The Mongo image is one build tagged for every supported server version; its
+  `mongodump` supports MongoDB 7.0 to 9.0.
+- Every version tag also exists as an immutable `<version>-<UTC build time>` tag, for
+  example `17-20261030T031700Z` or `8.0-20261030T031700Z`. The moving tag (`17`) acts
+  as "latest" for that version; the timestamp tag pins one exact build. `latest` has
+  no timestamp tag.
+- The version lists live in `docker/versions.env`; adding a PostgreSQL major is a
+  one-line change there.
 
 Everything below about destinations, scheduling, encryption and secrets applies
 to both. MongoDB specifics are in [MongoDB image](#mongodb-image).
 
 Scheduled PostgreSQL backups that are automatically synced to one or more S3
 destinations, each on its own schedule, with optional password-based encryption.
-It builds on the excellent
+The PostgreSQL image is no longer built on
 [`prodrigestivill/postgres-backup-local`](https://hub.docker.com/r/prodrigestivill/postgres-backup-local)
-image and adds the AWS CLI, a `post-backup` hook, and a per-destination sync
-scheduler, so every local dump is mirrored off-site without any extra moving
-parts.
+(its images are not rebuilt for security fixes). It ships a port of that project's
+scripts (MIT, see [License](#license)) on a fresh `ubuntu:24.04` base with only the
+PostgreSQL client from the official PGDG repository, and stays
+**environment-compatible**: same variables and defaults, same `last/daily/weekly/monthly`
+layout and file names, same hooks, webhooks, healthcheck and `/backup.sh`. Existing
+configurations keep working.
 
 ## Why
 
-`postgres-backup-local` already handles scheduled `pg_dump` runs and rotation
+`postgres-backup-local` handles scheduled `pg_dump` runs and rotation
 (last / daily / weekly / monthly). This image keeps all of that and ships each
 backup to S3, giving you durable off-site copies of databases that may contain
 PII. You can fan the same backups out to several buckets (even across
@@ -46,9 +65,10 @@ dump.
 - Server-side encryption via `--sse aws:kms` (auto-disabled for non-AWS
   endpoints, still overridable)
 - **File-based secrets** for `AWS_SECRET_ACCESS_KEY` and the encryption
-  passphrase (plus `POSTGRES_PASSWORD_FILE` from the base image)
+  passphrase (plus `POSTGRES_PASSWORD_FILE`, `POSTGRES_USER_FILE` and `POSTGRES_DB_FILE`)
 - AWS CLI v2, architecture-aware (amd64 + arm64)
-- Drop-in replacement for `postgres-backup-local:17`
+- Environment-compatible drop-in for `postgres-backup-local` (same variables, layout, hooks and healthcheck), rebuilt twice a day on a fresh base
+- Works as a non-root user (`--user`)
 
 ## Usage
 
@@ -57,9 +77,9 @@ A single destination behaves exactly like before:
 ```yaml
 services:
   pg-backup:
-    image: cc0funobit/pg-backup-s3:17
+    image: cc0funobit/pg-backup-s3:18
     environment:
-      # postgres-backup-local settings
+      # PostgreSQL settings
       POSTGRES_HOST: db
       POSTGRES_DB: app
       POSTGRES_USER: app
@@ -79,9 +99,9 @@ the primary target:
 ```yaml
 services:
   pg-backup:
-    image: cc0funobit/pg-backup-s3:17
+    image: cc0funobit/pg-backup-s3:18
     environment:
-      # --- Postgres (base image) ---
+      # --- PostgreSQL ---
       POSTGRES_HOST: db
       POSTGRES_DB: app
       POSTGRES_USER: app
@@ -226,14 +246,83 @@ Compose / Swarm secrets). Supported here:
 
 - `AWS_SECRET_ACCESS_KEY_FILE` (and `AWS_SECRET_ACCESS_KEY_N_FILE`)
 - `ENCRYPTION_PASSPHRASE_FILE` (and `ENCRYPTION_PASSPHRASE_N_FILE`)
-- `POSTGRES_PASSWORD_FILE`, `POSTGRES_USER_FILE`, `POSTGRES_DB_FILE` — provided
-  by the base image
+- `POSTGRES_PASSWORD_FILE`, `POSTGRES_USER_FILE`, `POSTGRES_DB_FILE` (one database
+  per line), `POSTGRES_PASSFILE_STORE` (a libpq passfile)
 
-If both the plain variable and its `_FILE` companion are set, the plain value
-wins.
+For `AWS_*` and `ENCRYPTION_*`, the plain value wins when both the variable and
+its `_FILE` companion are set. For `POSTGRES_*` the `_FILE` value wins, as in
+`postgres-backup-local`.
 
-Standard `POSTGRES_*`, `SCHEDULE`, and rotation variables are inherited from the
-base image — see its documentation for the full list.
+## PostgreSQL settings
+
+These are the `postgres-backup-local` variables, with the same defaults. An empty
+value or `**None**` means "unset".
+
+| Variable                   | Default       | Description                                                                 |
+|----------------------------|---------------|-----------------------------------------------------------------------------|
+| `POSTGRES_HOST`            | _(required)_  | Server host. Falls back to `POSTGRES_PORT_5432_TCP_ADDR` / `_PORT` (legacy links) |
+| `POSTGRES_PORT`            | `5432`        | Server port                                                                 |
+| `POSTGRES_DB` (+`_FILE`)   | _(required)_  | Comma or space separated databases, one dump each. The file lists one per line |
+| `POSTGRES_USER` (+`_FILE`) | _(required)_  | User name                                                                   |
+| `POSTGRES_PASSWORD` (+`_FILE`) | _(one of)_ | Password. Given to `pg_dump` through `PGPASSWORD`, never on the command line |
+| `POSTGRES_PASSFILE_STORE`  | _(none)_      | Path of a libpq passfile, used when neither password variable is set        |
+| `POSTGRES_EXTRA_OPTS`      | `-Z1`         | Extra `pg_dump` / `pg_dumpall` flags                                        |
+| `POSTGRES_CLUSTER`         | `FALSE`       | `TRUE` runs `pg_dumpall` instead of `pg_dump`; `POSTGRES_DB` then names the maintenance database |
+| `SCHEDULE`                 | `@daily`      | Dump schedule. 5 (or 6, seconds first) fields or a descriptor such as `@every 6h`. An invalid value stops the container at startup |
+| `VALIDATE_ON_START`        | `TRUE`        | Check the configuration at start and fail fast                              |
+| `BACKUP_ON_START`          | `FALSE`       | Also dump once at container start                                           |
+| `BACKUP_DIR`               | `/backups`    | Where the dumps and the rotation folders live                               |
+| `BACKUP_SUFFIX`            | `.sql.gz`     | Dump file extension                                                         |
+| `BACKUP_LATEST_TYPE`       | `symlink`     | `symlink` or `hardlink` creates `<db>-latest<suffix>` in each folder; anything else creates none |
+| `BACKUP_KEEP_MINS` / `_DAYS` / `_WEEKS` / `_MONTHS` | `1440` / `7` / `4` / `6` | Local rotation |
+| `HEALTHCHECK_PORT`         | `8080`        | go-cron status endpoint used by the healthcheck (unauthenticated; don't publish it) |
+| `TZ`                       | _(UTC)_       | Time zone for cron schedules and file names                                 |
+
+`VALIDATE_ON_START`, `BACKUP_ON_START` and `POSTGRES_CLUSTER` accept `1`, `true`,
+`yes` or `on` in any case. Dumps are written as `<file>.partial` and renamed when
+complete, and `s3-sync` never ships a `.partial` file.
+
+Run a backup on demand with `docker compose exec pg-backup /backup.sh`.
+
+### Webhooks
+
+The PostgreSQL image (not the Mongo image) can call webhooks around each backup.
+Each call is an HTTP `POST` with the JSON body `{"status": "<action>"}`.
+
+| Variable                  | Called on                  |
+|---------------------------|----------------------------|
+| `WEBHOOK_URL`             | `post-backup` and `error`  |
+| `WEBHOOK_PRE_BACKUP_URL`  | `pre-backup`               |
+| `WEBHOOK_POST_BACKUP_URL` | `post-backup`              |
+| `WEBHOOK_ERROR_URL`       | `error`                    |
+| `WEBHOOK_EXTRA_ARGS`      | extra `curl` arguments for every call |
+
+The URL is handed to `curl` on stdin and is never logged, so tokens inside it stay
+out of `ps` and the container logs.
+
+## Running as a non-root user
+
+The default user is root, for compatibility with existing setups. Both images also
+work with `--user <uid>:<gid>` (Compose: `user: "10001:10001"`). The sync lock files
+live in `/tmp`, gpg uses a private temporary home, and nothing else needs a
+writable system path. Two things to set up:
+
+- `/backups` must be writable by that uid. Docker resets the owner of an **empty**
+  named volume to root every time it is mounted, so create a folder in it as well:
+
+  ```bash
+  # named volume
+  docker run --rm -v pg-backups:/backups cc0funobit/pg-backup-s3:18 \
+    sh -c 'mkdir -p /backups/last && chown -R 10001:10001 /backups'
+  # bind mount
+  sudo chown -R 10001:10001 /srv/pg-backups
+  ```
+
+  If it is not writable, the container stops at start with a message naming the uid.
+- Keep `HEALTHCHECK_PORT` above 1024.
+
+The PostgreSQL image also contains a `postgres` user (uid/gid 999), so the
+`user: postgres:postgres` that `postgres-backup-local` recommends keeps working.
 
 ## How it works
 
@@ -242,10 +331,10 @@ All the S3 logic lives in one script, `/usr/local/bin/s3-sync` (run
 `s3-sync --list` to print the destinations and how each one is triggered). It is
 driven from two places:
 
-- The bundled `post-backup` hook, which the base image runs after each dump. It
+- The bundled `post-backup` hook, which `/backup.sh` runs after each dump. It
   syncs every destination that has no schedule (`s3-sync --immediate`).
 - One `go-cron` scheduler per destination that has an `S3_SCHEDULE[_N]`, started
-  by the image's default command before it hands over to the base image's
+  by the image's default command before it hands over to the image's
   `/init.sh`. Each scheduler runs `s3-sync --dest <id>` on its own cadence.
 
 For an unencrypted destination the sync mirrors the local layout directly:
@@ -272,7 +361,7 @@ copy from an empty source.
 
 Each destination runs in its own subshell, so credentials and flags never leak
 between targets. If any destination fails, the run exits non-zero (which makes
-the base image treat that backup as failed and fire its `error` hooks).
+`/backup.sh` treat that backup as failed and fire its `error` hooks).
 
 Two guards keep concurrent syncs honest, both using files under
 `S3_SYNC_STATE_DIR`:
@@ -305,10 +394,10 @@ gunzip app-20240101.sql.gz
 
 ## MongoDB image
 
-`cc0funobit/mongo-backup-s3:8.0` runs `mongodump` on `SCHEDULE` and keeps the
+One `cc0funobit/mongo-backup-s3` image (tags `7.0`, `8.0`, `8.3`, `9.0` and `latest`) runs `mongodump` on `SCHEDULE` and keeps the
 same `last/daily/weekly/monthly` layout and `BACKUP_KEEP_*` rotation as the
 Postgres image, then ships the backups with the same `s3-sync`. It is built on
-`ubuntu:24.04` with MongoDB Database Tools 100.19.0 (supports MongoDB 8.0), the
+`ubuntu:24.04` with `mongodump` and `mongorestore` from MongoDB Database Tools 100.20.0 (built from source with the current Go; the other tools are not included; they support MongoDB servers 7.0 to 9.0), the
 AWS CLI v2 and `go-cron`, for amd64 and arm64.
 
 ```yaml
@@ -368,7 +457,7 @@ Notes:
   never ships `.partial` files, so a scheduled sync that stops waiting for a long
   dump can't upload a half-written archive.
 - Run a backup on demand with `docker compose exec mongo-backup /backup.sh`.
-- `WEBHOOK_*` notifications from the Postgres base image are not available here.
+- `WEBHOOK_*` notifications are PostgreSQL-image only and are not available here.
 
 Restore (decrypt first for encrypted destinations, as shown above):
 
@@ -377,35 +466,75 @@ mongorestore --uri="mongodb://user:pass@host:27017/?authSource=admin" \
   --archive=all-20240101-000000.archive.gz --gzip          # add --oplogReplay for --oplog dumps
 ```
 
+## CI and publishing
+
+`.github/workflows/images.yml` builds, tests, scans and publishes every image:
+
+- **When:** twice a day (03:17 and 15:17 UTC), on every push to `main` and on demand
+  (`workflow_dispatch`). Pull requests build, test and scan but never publish and get
+  no secrets.
+- **What:** every PostgreSQL major in `docker/versions.env` plus the Mongo image, for
+  `linux/amd64` and `linux/arm64` on native runners, built with `--pull --no-cache`
+  so scheduled runs really pick up base-image and package fixes.
+- **Tests:** `tests/e2e.sh` runs against every PostgreSQL major and every MongoDB
+  server version on both architectures.
+- **Scan:** [Grype](https://github.com/anchore/grype) fails the build on fixable
+  Critical or High findings that are not listed in [`.grype.yaml`](.grype.yaml). The
+  known leftovers are explained in [`technical_debt.md`](technical_debt.md). On a
+  scheduled run the tested images are still published and the run is then marked
+  failed, so you get the failure email.
+- **Publish:** only the exact per-architecture digests that passed the tests get
+  tags (`<version>`, `<version>-<UTC timestamp>`, and `latest`), merged into
+  multi-arch manifests. Images carry SBOM and provenance attestations.
+- **Supply chain:** every action is pinned to a commit SHA, Dependabot keeps them
+  current, and every download in the Dockerfiles is verified (git commit, PGP
+  signature or signed apt repository).
+
+GitHub disables scheduled workflows in public repositories after 60 days without
+repository activity. Re-enable it under Actions → images → Enable workflow, or with
+`gh workflow enable images.yml`. There is no keepalive job.
+
 ## Building
 
 The Dockerfiles live under `docker/`; the build context must be the repository
-root so `hooks/` (the run-parts hook) and `lib/` (`s3-sync`, the entrypoint
-wrapper and the Mongo scripts) are included:
+root so `hooks/`, `lib/` and `docker/keys/` are included. The versions come from
+`docker/versions.env`:
 
 ```bash
-docker build -f docker/Dockerfile.pg-backup \
-  -t cc0funobit/pg-backup-s3:17 \
-  -t cc0funobit/pg-backup-s3:latest .
+sh scripts/build.sh              # every PostgreSQL major and the Mongo image
+sh scripts/build.sh pg 18        # one PostgreSQL major
+sh scripts/build.sh mongo        # the Mongo image (all version tags)
 
-docker build -f docker/Dockerfile.mongo-backup \
-  -t cc0funobit/mongo-backup-s3:8.0 .
+# the same, spelled out
+docker build -f docker/Dockerfile.pg-backup --build-arg PG_MAJOR=18 \
+  -t cc0funobit/pg-backup-s3:18 -t cc0funobit/pg-backup-s3:latest .
+docker build -f docker/Dockerfile.mongo-backup -t cc0funobit/mongo-backup-s3:latest .
 ```
 
-Multi-arch build and push:
+`PG_MAJOR` is required. `DOCKER_BUILD_FLAGS="--pull --no-cache"` adds flags to the
+script's `docker build`. Multi-arch example for your own registry:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile.pg-backup \
-  -t cc0funobit/pg-backup-s3:17 \
-  -t cc0funobit/pg-backup-s3:latest \
-  --push .
-
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile.mongo-backup \
-  -t cc0funobit/mongo-backup-s3:8.0 \
-  --push .
+  -f docker/Dockerfile.pg-backup --build-arg PG_MAJOR=18 \
+  -t <your-repo>/pg-backup-s3:18 --push .
 ```
+
+The official `cc0funobit/*` images are published by CI only.
+
+## Testing
+
+```bash
+sh tests/e2e.sh pg cc0funobit/pg-backup-s3:18 18
+sh tests/e2e.sh mongo cc0funobit/mongo-backup-s3:latest 9.0
+```
+
+It needs only Docker. The script starts the database, an S3-compatible server and
+(PostgreSQL) a webhook receiver, runs backups to plain, GPG and OpenSSL
+destinations as root and as `--user 10001:10001`, checks the local layout and the
+bucket contents, downloads and decrypts the objects, restores into a fresh database
+and compares the data, and checks the scheduler, the healthcheck, startup rejection
+of bad cron specs and the failure path.
 
 ## Docker Hub
 
@@ -415,15 +544,11 @@ Prebuilt, multi-arch images are published to Docker Hub:
 - **https://hub.docker.com/r/cc0funobit/mongo-backup-s3**
 
 ```bash
-docker pull cc0funobit/pg-backup-s3:17
+docker pull cc0funobit/pg-backup-s3:18
 docker pull cc0funobit/mongo-backup-s3:8.0
 ```
 
-## Tags
-
-- `pg-backup-s3:17` — built against PostgreSQL 17 (matches `postgres:17` servers)
-- `pg-backup-s3:latest` — points at the current stable Postgres build
-- `mongo-backup-s3:8.0` — for MongoDB 8.0 servers
+See [Images and tags](#images-and-tags) for the tag scheme.
 
 ## Notes
 
@@ -434,17 +559,24 @@ docker pull cc0funobit/mongo-backup-s3:8.0
 - Store the encryption passphrase somewhere safe and separate from the backups —
   without it, encrypted backups cannot be restored.
 
+
 ## License
 
-This project's hook scripts and Dockerfile are released under the
+This project's scripts and Dockerfiles are released under the
 [MIT License](LICENSE).
 
-Note that the published image bundles third-party software with its own terms:
-[`prodrigestivill/postgres-backup-local`](https://github.com/prodrigestivill/docker-postgres-backup-local),
-[`go-cron`](https://github.com/prodrigestivill/go-cron),
-[MongoDB Database Tools](https://github.com/mongodb/mongo-tools)
-and the [AWS CLI](https://github.com/aws/aws-cli). Refer to their respective
-licenses for those components.
+The PostgreSQL image's `init.sh`, `env.sh`, `backup.sh` and webhook hook under
+`lib/pg/` are a port of
+[`prodrigestivill/docker-postgres-backup-local`](https://github.com/prodrigestivill/docker-postgres-backup-local)
+(MIT, Copyright (c) 2023 Pau Rodriguez-Estivill and Johannes Schickling). The
+notice is in [`lib/pg/NOTICE`](lib/pg/NOTICE) and in the image at
+`/usr/share/doc/pg-backup-s3/NOTICE.postgres-backup-local`.
+
+The published images also bundle third-party software with its own terms: the
+PostgreSQL client (PGDG), [`go-cron`](https://github.com/prodrigestivill/go-cron),
+[MongoDB Database Tools](https://github.com/mongodb/mongo-tools), the
+[AWS CLI](https://github.com/aws/aws-cli) and Ubuntu packages. Refer to their
+respective licenses for those components.
 
 ---
 

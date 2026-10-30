@@ -153,6 +153,11 @@ encrypt_file() {
   esac
 }
 
+# stop the gpg-agent that gpg started for a throwaway GNUPGHOME
+stop_gpg_agent() {
+  [ -n "${GNUPGHOME:-}" ] || return 0
+  gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+}
 ship_one() {
   id="$1"
   sfx=$(sfx_for "$id")
@@ -204,11 +209,21 @@ ship_one() {
       *) log "destination $id: unknown ENCRYPTION_METHOD '$method'"; return 1 ;;
     esac
 
-    stage=$(mktemp -d)
+    # private per-destination temp dir: staging tree, file list and (for gpg)
+    # a throwaway GNUPGHOME, so gpg works for any --user and keeps no state
+    work=$(mktemp -d)
+    chmod 700 "$work"
+    stage="$work/stage"
+    mkdir "$stage"
+    if [ "$method" = gpg ]; then
+      GNUPGHOME="$work/gnupg"
+      mkdir -m 700 "$GNUPGHOME"
+      export GNUPGHOME
+    fi
     # shellcheck disable=SC2064
-    trap "rm -rf \"$stage\"" EXIT INT TERM
+    trap "stop_gpg_agent; rm -rf \"$work\"" EXIT INT TERM
 
-    filelist=$(mktemp)
+    filelist="$work/files"
     find "$BACKUP_DIR" -type f ! -name '*.partial' > "$filelist"
     while IFS= read -r src; do
       rel=${src#"$BACKUP_DIR"/}
@@ -216,7 +231,6 @@ ship_one() {
       mkdir -p "$(dirname "$out")"
       encrypt_file "$method" "$pass" "$src" "$out"
     done < "$filelist"
-    rm -f "$filelist"
 
     log "destination $id: syncing encrypted ($method) backups to $target"
     # staging is a full re-render of the current backup tree, so a --delete sync
@@ -224,7 +238,8 @@ ship_one() {
     # --delete off (S3_DELETE=false) makes the remote accumulate ciphertext
     aws s3 sync "$stage" "$target" "$@" --only-show-errors
 
-    rm -rf "$stage"
+    stop_gpg_agent
+    rm -rf "$work"
     trap - EXIT INT TERM
   else
     log "destination $id: syncing backups to $target"

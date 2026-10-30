@@ -2,52 +2,104 @@
 # per-destination scheduling and encryption as pg-backup-s3.
 #
 # Build from the repository root (the context needs hooks/ and lib/):
-#   docker build -f docker/Dockerfile.mongo-backup -t cc0funobit/mongo-backup-s3:8.0 .
+#   docker build -f docker/Dockerfile.mongo-backup -t cc0funobit/mongo-backup-s3:latest .
+#   sh scripts/build.sh mongo
 #
-# Ubuntu rather than Debian: MongoDB only publishes arm64 Database Tools
-# packages for Ubuntu (the Debian ones are x86_64-only).
-FROM ubuntu:24.04
+# Built on ubuntu:24.04 like the pg image. mongodump and mongorestore (Database
+# Tools 100.20.0) are built from source with the current Go and work with
+# MongoDB servers 7.0 to 9.0 (the tools support their own server version and
+# older ones), so one image serves every tag listed in docker/versions.env.
 
-# Database Tools 100.19.0 supports MongoDB Server 8.0 (and up to 9.0).
-ARG MONGO_TOOLS_VERSION=100.19.0
-ARG MONGO_TOOLS_SHA256_AMD64=af7a31c1247082e6e3fec0e76aefd6df0df0f1a64809b0aeb3b17adfe0090cb1
-ARG MONGO_TOOLS_SHA256_ARM64=b4b82477c2d0308afbd5be6cf86ea37112daa37b5c19b0df8c42142916d2d6cb
-# same go-cron as prodrigestivill/postgres-backup-local, so SCHEDULE and
-# S3_SCHEDULE accept exactly the same syntax in both images
+ARG BASE_IMAGE=ubuntu:24.04
+ARG GO_VERSION=1.27
+
+# ---- go-cron (keep this stage identical in both Dockerfiles) ----
+# Same prodrigestivill/go-cron release as postgres-backup-local, so SCHEDULE and
+# S3_SCHEDULE syntax is unchanged; built from source with the current Go and
+# cross-compiled on the build platform (no Go under QEMU).
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-cron
 ARG GOCRONVER=v0.0.11
+ARG GOCRON_COMMIT=4e5a8e635e2a493aa4e49a8db23294ce4325cffd
+ARG TARGETOS
+ARG TARGETARCH
+RUN set -eux; \
+    git clone --quiet --depth 1 --branch "$GOCRONVER" https://github.com/prodrigestivill/go-cron.git /src; \
+    cd /src; \
+    test "$(git rev-parse HEAD)" = "$GOCRON_COMMIT"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$TARGETARCH" GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+      go build -trimpath -ldflags "-s -w -X main.version=$GOCRONVER -X main.build=$GOCRON_COMMIT" -o /out/go-cron .
+
+# ---- mongodump + mongorestore, built from source with the current Go ----
+# Only these two tools are shipped. -tags gssapi keeps Kerberos auth (cgo,
+# needs libgssapi-krb5-2 at runtime); SCRAM, X.509, AWS IAM and PLAIN are pure Go.
+FROM golang:${GO_VERSION}-bookworm AS mongo-tools
+ARG MONGO_TOOLS_VERSION=100.20.0
+ARG MONGO_TOOLS_COMMIT=7536fd7f3d67f5115de3eb2e271b327b7ce329b9
+ARG DEBIAN_FRONTEND=noninteractive
+RUN set -eux; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libkrb5-dev; \
+    git clone --quiet --depth 1 --branch "$MONGO_TOOLS_VERSION" https://github.com/mongodb/mongo-tools.git /src; \
+    cd /src; \
+    test "$(git rev-parse HEAD)" = "$MONGO_TOOLS_COMMIT"; \
+    for t in mongodump mongorestore; do \
+      CGO_ENABLED=1 GOTOOLCHAIN=local GOFLAGS=-mod=vendor \
+        go build -trimpath -buildmode=pie -tags gssapi \
+        -ldflags "-X main.VersionStr=$MONGO_TOOLS_VERSION -X main.GitCommit=$MONGO_TOOLS_COMMIT" \
+        -o "/out/$t" "./$t/main"; \
+    done; \
+    /out/mongodump --version
+
+# ---- AWS CLI v2 (keep this stage identical in both Dockerfiles) ----
+# Latest release at build time, PGP-verified against the AWS CLI Team key
+# (fingerprint from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
+FROM ${BASE_IMAGE} AS awscli
 ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
-
-# mongodump, AWS CLI v2, gnupg/openssl for optional encryption, util-linux for
-# flock, curl for the healthcheck and tzdata so TZ applies to cron schedules.
+ARG AWSCLI_KEY_FPR=FB5DB77FD5C118B80511ADA8A6310ACC4672475C
+# CA bundle so apt can use HTTPS before the ca-certificates package is installed
+COPY --from=go-cron /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY docker/keys/aws-cli.asc /tmp/aws-cli.asc
 RUN set -eux; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl unzip gpg gpg-agent; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "$arch" in \
-      amd64) tools_arch="x86_64";  tools_sha="$MONGO_TOOLS_SHA256_AMD64"; awscli_arch="x86_64" ;; \
-      arm64) tools_arch="arm64";   tools_sha="$MONGO_TOOLS_SHA256_ARM64"; awscli_arch="aarch64" ;; \
+      amd64) awscli_arch=x86_64 ;; \
+      arm64) awscli_arch=aarch64 ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      ca-certificates curl unzip gnupg openssl util-linux tzdata; \
-    deb="/tmp/mongodb-database-tools.deb"; \
-    curl -fsSL --retry 4 -o "$deb" \
-      "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-${tools_arch}-${MONGO_TOOLS_VERSION}.deb"; \
-    echo "${tools_sha}  ${deb}" | sha256sum -c -; \
-    apt-get install -y --no-install-recommends "$deb"; \
-    rm -f "$deb"; \
-    curl -fsSL --retry 4 "https://github.com/prodrigestivill/go-cron/releases/download/${GOCRONVER}/go-cron-linux-${arch}.gz" \
-      | gzip -d > /usr/local/bin/go-cron; \
-    chmod +x /usr/local/bin/go-cron; \
-    curl -fsSL --retry 4 "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip; \
+    url="https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip"; \
+    curl -fsSL --retry 4 -o /tmp/awscliv2.zip "$url"; \
+    curl -fsSL --retry 4 -o /tmp/awscliv2.zip.sig "$url.sig"; \
+    GNUPGHOME="$(mktemp -d)"; export GNUPGHOME; \
+    gpg --batch --quiet --import /tmp/aws-cli.asc; \
+    signer=$(gpg --batch --status-fd 1 --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip 2>/dev/null | awk '$2 == "VALIDSIG" { print $NF }'); \
+    test "$signer" = "$AWSCLI_KEY_FPR"; \
     unzip -q /tmp/awscliv2.zip -d /tmp; \
-    /tmp/aws/install; \
-    rm -rf /tmp/aws /tmp/awscliv2.zip; \
-    apt-get purge -y --auto-remove unzip; \
-    rm -rf /var/lib/apt/lists/*; \
-    mongodump --version; \
-    aws --version; \
-    flock --version
+    /tmp/aws/install --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin; \
+    /usr/local/bin/aws --version
+
+FROM ${BASE_IMAGE}
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --from=go-cron /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# curl for the healthcheck, gpg/gpg-agent and openssl for optional encryption,
+# tzdata so TZ applies to cron schedules, libgssapi-krb5-2 for mongodump's
+# Kerberos support. flock (util-linux) and run-parts are in the base.
+RUN set -eux; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get upgrade -y; \
+    apt-get install -y --no-install-recommends ca-certificates curl gpg gpg-agent openssl tzdata libgssapi-krb5-2; \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=mongo-tools /out/mongodump /out/mongorestore /usr/local/bin/
+COPY --from=go-cron /out/go-cron /usr/local/bin/go-cron
+COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
 
 # Defaults mirror postgres-backup-local where the meaning is the same.
 # BACKUP_LATEST_TYPE=none: S3 has no links, so -latest links would upload every
@@ -78,16 +130,18 @@ COPY lib/mongo/backup.sh /backup.sh
 COPY hooks/ /hooks/
 # Strip any CR so a CRLF-saved script can't break the shebang, then mark exec.
 RUN set -eux; \
+    ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws; \
     scripts="/hooks/* /usr/local/bin/s3-sync /usr/local/bin/mongo-backup-s3-entrypoint /init.sh /env.sh /backup.sh"; \
     sed -i 's/\r$//' $scripts; \
     chmod +x $scripts; \
     for s in $scripts; do sh -n "$s"; done; \
-    mkdir -p /backups
-
+    mkdir -p /backups; \
+    mongodump --version; \
+    mongorestore --version; \
+    aws --version; \
+    flock --version
 VOLUME /backups
-
 # go-cron's status endpoint: unauthenticated, so don't publish this port.
 HEALTHCHECK --interval=5m --timeout=3s \
   CMD curl -f "http://localhost:$HEALTHCHECK_PORT/" || exit 1
-
 CMD ["/usr/local/bin/mongo-backup-s3-entrypoint"]

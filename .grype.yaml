@@ -1,0 +1,10 @@
+# Grype configuration used by .github/workflows/images.yml and the local scan
+# in technical_debt.md. Each ignore entry is one known residual finding that
+# is documented in technical_debt.md ("Ignored fixable findings"); keep the two
+# lists in sync. CI fails on fixable Critical/High findings not listed here.
+ignore:
+  - vulnerability: CVE-2026-115557
+    package:
+      name: python
+      location: "/usr/local/aws-cli/**"
+    reason: "CPython 3.14.8 bundled in the AWS CLI v2 installer; fixed when AWS ships a bundle with Python 3.14.10 or newer. See technical_debt.md#ignored-fixable-findings-grypeyaml"

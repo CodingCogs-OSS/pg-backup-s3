@@ -7,3 +7,11 @@ lib/* text eol=lf
 # lib/* does not match files in subdirectories such as lib/mongo/
 lib/** text eol=lf
 *.sh text eol=lf
+
+
+# version list sourced by scripts/*.sh, tests and CI scripts, PGP keys, CI files
+docker/versions.env text eol=lf
+docker/keys/* text eol=lf
+scripts/** text eol=lf
+tests/** text eol=lf
+.github/** text eol=lf

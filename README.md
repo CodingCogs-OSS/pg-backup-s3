@@ -1,8 +1,20 @@
-# pg-backup-s3
+# pg-backup-s3 / mongo-backup-s3
 
 [![Docker Hub](https://img.shields.io/docker/pulls/cc0funobit/pg-backup-s3?logo=docker&label=Docker%20Hub)](https://hub.docker.com/r/cc0funobit/pg-backup-s3)
 [![Image Size](https://img.shields.io/docker/image-size/cc0funobit/pg-backup-s3/17?logo=docker&label=image%20size)](https://hub.docker.com/r/cc0funobit/pg-backup-s3)
+[![Docker Hub](https://img.shields.io/docker/pulls/cc0funobit/mongo-backup-s3?logo=docker&label=mongo-backup-s3)](https://hub.docker.com/r/cc0funobit/mongo-backup-s3)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+This repository builds two images that share the same S3 layer (multi-destination
+fan-out, per-destination schedules, encryption):
+
+| Image                              | Database        | Dockerfile                      |
+|------------------------------------|-----------------|---------------------------------|
+| `cc0funobit/pg-backup-s3:17`       | PostgreSQL 17   | `docker/Dockerfile.pg-backup`   |
+| `cc0funobit/mongo-backup-s3:8.0`   | MongoDB 8.0     | `docker/Dockerfile.mongo-backup`|
+
+Everything below about destinations, scheduling, encryption and secrets applies
+to both. MongoDB specifics are in [MongoDB image](#mongodb-image).
 
 Scheduled PostgreSQL backups that are automatically synced to one or more S3
 destinations, each on its own schedule, with optional password-based encryption.
@@ -122,7 +134,7 @@ variables convenient shared defaults.
 | Variable (and `_N` form)         | Default                 | Description                                                  |
 |----------------------------------|-------------------------|--------------------------------------------------------------|
 | `S3_BUCKET` / `S3_BUCKET_N`       | _(required)_            | Target bucket. Presence of `S3_BUCKET_N` defines destination N |
-| `S3_PREFIX` / `S3_PREFIX_N`       | `pg-backups`            | Key prefix within the bucket                                 |
+| `S3_PREFIX` / `S3_PREFIX_N`       | `pg-backups` / `mongo-backups` | Key prefix within the bucket (default depends on the image) |
 | `S3_REGION` / `S3_REGION_N`       | `AWS_DEFAULT_REGION`    | Region for that destination                                  |
 | `S3_ENDPOINT` / `S3_ENDPOINT_N`   | _(none = AWS)_          | Custom S3 endpoint URL (Backblaze B2, MinIO, …)              |
 | `S3_SSE` / `S3_SSE_N`             | `aws:kms` / none        | Server-side encryption. Defaults to `aws:kms` on AWS and to none when an endpoint is set. Set to `""` to force off |
@@ -185,7 +197,8 @@ Notes:
   about the exact hour. An unparseable spec fails the container at startup rather
   than silently never syncing.
 - Scheduling needs the image's default command
-  (`/usr/local/bin/pg-backup-s3-entrypoint`). If you override `command:` /
+  (`/usr/local/bin/pg-backup-s3-entrypoint`, or
+  `/usr/local/bin/mongo-backup-s3-entrypoint` in the Mongo image). If you override `command:` /
   `entrypoint:` in Compose, the schedulers never start and the hook warns about
   it on the next backup.
 - To push on demand, regardless of schedules:
@@ -290,25 +303,107 @@ openssl enc -d -aes-256-cbc -pbkdf2 -pass file:./pass \
 gunzip app-20240101.sql.gz
 ```
 
-## Building
+## MongoDB image
 
-The Dockerfile lives under `hooks/`, but the build context must be the
-repository root so both `hooks/` (the run-parts hook) and `lib/` (`s3-sync` and
-the entrypoint wrapper) are included:
+`cc0funobit/mongo-backup-s3:8.0` runs `mongodump` on `SCHEDULE` and keeps the
+same `last/daily/weekly/monthly` layout and `BACKUP_KEEP_*` rotation as the
+Postgres image, then ships the backups with the same `s3-sync`. It is built on
+`ubuntu:24.04` with MongoDB Database Tools 100.19.0 (supports MongoDB 8.0), the
+AWS CLI v2 and `go-cron`, for amd64 and arm64.
+
+```yaml
+services:
+  mongo-backup:
+    image: cc0funobit/mongo-backup-s3:8.0
+    environment:
+      MONGO_HOST: mongo
+      MONGO_USER: backup
+      MONGO_PASSWORD_FILE: /run/secrets/mongo_password
+      SCHEDULE: "@daily"
+      S3_BUCKET: my-backup-bucket          # S3_PREFIX defaults to mongo-backups
+      AWS_ACCESS_KEY_ID: ...
+      AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/aws_secret
+      AWS_DEFAULT_REGION: eu-central-1
+    volumes:
+      - mongo-backups:/backups
+    secrets: [mongo_password, aws_secret]
+```
+
+Replica set with a point-in-time consistent dump:
+
+```yaml
+    environment:
+      MONGO_URI_FILE: /run/secrets/mongo_uri   # mongodb://user:pass@h1,h2,h3/?replicaSet=rs0&authSource=admin
+      MONGO_EXTRA_OPTS: "--oplog --readPreference=secondary"
+```
+
+| Variable                          | Default          | Description                                                   |
+|-----------------------------------|------------------|---------------------------------------------------------------|
+| `MONGO_URI` (+`_FILE`)            | _(none)_         | Full connection string (replica sets, `mongodb+srv://`, TLS options). When set, `MONGO_HOST`/`MONGO_PORT` are ignored |
+| `MONGO_HOST` / `MONGO_PORT`       | _(none)_ / `27017` | Server to dump when no URI is set. Either a URI or a host is required |
+| `MONGO_USER` (+`_FILE`)           | _(none)_         | Username; leave unset for instances without auth or when the URI holds credentials |
+| `MONGO_PASSWORD` (+`_FILE`)       | _(none)_         | Password                                                      |
+| `MONGO_AUTH_DB`                   | `admin`          | Authentication database (used with `MONGO_USER`)              |
+| `MONGO_DB` (+`_FILE`)             | _(whole instance)_ | Comma/space separated databases, one archive each. Unset dumps the whole instance into one archive |
+| `MONGO_DUMP_NAME`                 | `all`            | File name prefix of the whole-instance archive                |
+| `MONGO_EXTRA_OPTS`                | _(none)_         | Extra `mongodump` flags, e.g. `--oplog`, `--readPreference=secondary`, `--numParallelCollections=2` |
+| `SCHEDULE`                        | `@daily`         | Dump schedule (same syntax as `S3_SCHEDULE`)                  |
+| `BACKUP_ON_START`                 | `FALSE`          | Also dump once at container start                             |
+| `VALIDATE_ON_START`               | `TRUE`           | Check the configuration at start and fail fast                |
+| `BACKUP_KEEP_MINS` / `_DAYS` / `_WEEKS` / `_MONTHS` | `1440` / `7` / `4` / `6` | Local rotation, same meaning as in the Postgres image |
+| `BACKUP_LATEST_TYPE`              | `none`           | `symlink`, `hardlink` or `none`. Defaults to `none` here because S3 stores links as full copies, which would upload every archive twice |
+| `BACKUP_SUFFIX`                   | `.archive.gz`    | Archive file extension                                        |
+| `HEALTHCHECK_PORT`                | `8080`           | go-cron status endpoint used by the healthcheck (unauthenticated; don't publish it) |
+
+Notes:
+
+- Files land in `/backups/{last,daily,weekly,monthly}/<db|all>-<stamp>.archive.gz`.
+  They are `mongodump --archive --gzip` archives, not plain gzip files.
+- The URI and password are passed to `mongodump` through a private `--config`
+  file, so they never show up on the command line (`ps`).
+- `--oplog` only works for whole-instance dumps of a replica set member (not
+  with `MONGO_DB`, not through `mongos`).
+- Give the backup user MongoDB's built-in `backup` role.
+- A dump is written as `<file>.partial` and renamed when complete; `s3-sync`
+  never ships `.partial` files, so a scheduled sync that stops waiting for a long
+  dump can't upload a half-written archive.
+- Run a backup on demand with `docker compose exec mongo-backup /backup.sh`.
+- `WEBHOOK_*` notifications from the Postgres base image are not available here.
+
+Restore (decrypt first for encrypted destinations, as shown above):
 
 ```bash
-docker build -f hooks/Dockerfile.pg-backup \
+mongorestore --uri="mongodb://user:pass@host:27017/?authSource=admin" \
+  --archive=all-20240101-000000.archive.gz --gzip          # add --oplogReplay for --oplog dumps
+```
+
+## Building
+
+The Dockerfiles live under `docker/`; the build context must be the repository
+root so `hooks/` (the run-parts hook) and `lib/` (`s3-sync`, the entrypoint
+wrapper and the Mongo scripts) are included:
+
+```bash
+docker build -f docker/Dockerfile.pg-backup \
   -t cc0funobit/pg-backup-s3:17 \
   -t cc0funobit/pg-backup-s3:latest .
+
+docker build -f docker/Dockerfile.mongo-backup \
+  -t cc0funobit/mongo-backup-s3:8.0 .
 ```
 
 Multi-arch build and push:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f hooks/Dockerfile.pg-backup \
+  -f docker/Dockerfile.pg-backup \
   -t cc0funobit/pg-backup-s3:17 \
   -t cc0funobit/pg-backup-s3:latest \
+  --push .
+
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.mongo-backup \
+  -t cc0funobit/mongo-backup-s3:8.0 \
   --push .
 ```
 
@@ -316,16 +411,19 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 Prebuilt, multi-arch images are published to Docker Hub:
 
-**https://hub.docker.com/r/cc0funobit/pg-backup-s3**
+- **https://hub.docker.com/r/cc0funobit/pg-backup-s3**
+- **https://hub.docker.com/r/cc0funobit/mongo-backup-s3**
 
 ```bash
 docker pull cc0funobit/pg-backup-s3:17
+docker pull cc0funobit/mongo-backup-s3:8.0
 ```
 
 ## Tags
 
-- `17` — built against PostgreSQL 17 (matches `postgres:17` servers)
-- `latest` — points at the current stable build
+- `pg-backup-s3:17` — built against PostgreSQL 17 (matches `postgres:17` servers)
+- `pg-backup-s3:latest` — points at the current stable Postgres build
+- `mongo-backup-s3:8.0` — for MongoDB 8.0 servers
 
 ## Notes
 
@@ -342,7 +440,9 @@ This project's hook scripts and Dockerfile are released under the
 [MIT License](LICENSE).
 
 Note that the published image bundles third-party software with its own terms:
-[`prodrigestivill/postgres-backup-local`](https://github.com/prodrigestivill/docker-postgres-backup-local)
+[`prodrigestivill/postgres-backup-local`](https://github.com/prodrigestivill/docker-postgres-backup-local),
+[`go-cron`](https://github.com/prodrigestivill/go-cron),
+[MongoDB Database Tools](https://github.com/mongodb/mongo-tools)
 and the [AWS CLI](https://github.com/aws/aws-cli). Refer to their respective
 licenses for those components.
 

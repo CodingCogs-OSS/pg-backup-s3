@@ -4,4 +4,6 @@
 hooks/post-backup text eol=lf
 hooks/* text eol=lf
 lib/* text eol=lf
+# lib/* does not match files in subdirectories such as lib/mongo/
+lib/** text eol=lf
 *.sh text eol=lf

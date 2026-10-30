@@ -40,8 +40,10 @@
 #
 # Secrets can be supplied indirectly with a *_FILE companion variable, e.g.
 #   AWS_SECRET_ACCESS_KEY_FILE, AWS_SECRET_ACCESS_KEY_2_FILE,
-#   ENCRYPTION_PASSPHRASE_FILE. (POSTGRES_PASSWORD_FILE is handled by the
-#   base image.)
+#   ENCRYPTION_PASSPHRASE_FILE. (Database credentials are handled by the
+#   image's own backup scripts.)
+#
+# Files ending in .partial are dumps still being written and are never shipped.
 
 set -eu
 
@@ -160,7 +162,8 @@ ship_one() {
 
   # a sync only ever runs off a finished dump, so BACKUP_DIR should hold files;
   # bail out if it is empty so a --delete sync can never wipe the remote copy
-  if [ -z "$(find "$BACKUP_DIR" -type f -print -quit 2>/dev/null)" ]; then
+  # (in-progress *.partial dumps don't count: they are excluded from the sync)
+  if [ -z "$(find "$BACKUP_DIR" -type f ! -name '*.partial' -print -quit 2>/dev/null)" ]; then
     log "destination $id: nothing under $BACKUP_DIR to ship, skipping"
     return 0
   fi
@@ -180,7 +183,8 @@ ship_one() {
   want_delete=$(getval S3_DELETE "$sfx"); [ -n "$want_delete" ] || want_delete="true"
 
   # build the shared aws flags as positional args (id is already saved above)
-  set --
+  # never ship a dump that is still being written
+  set -- --exclude '*.partial'
   [ -n "$endpoint" ] && set -- "$@" --endpoint-url "$endpoint"
   [ -n "$sse" ] && set -- "$@" --sse "$sse"
   is_true "$want_delete" && set -- "$@" --delete
@@ -205,7 +209,7 @@ ship_one() {
     trap "rm -rf \"$stage\"" EXIT INT TERM
 
     filelist=$(mktemp)
-    find "$BACKUP_DIR" -type f > "$filelist"
+    find "$BACKUP_DIR" -type f ! -name '*.partial' > "$filelist"
     while IFS= read -r src; do
       rel=${src#"$BACKUP_DIR"/}
       out="$stage/$rel$ext"
@@ -369,8 +373,9 @@ case "$mode" in
       for id in $deferred; do
         if [ -n "$(get_schedule "$id")" ]; then
           log "warning: scheduled destinations exist but no sync scheduler is running."
-          log "warning: the image must start via pg-backup-s3-entrypoint (its default"
-          log "warning: command) for S3_SCHEDULE to take effect."
+          log "warning: the image must start via its default command"
+          log "warning: (pg-backup-s3-entrypoint / mongo-backup-s3-entrypoint) for"
+          log "warning: S3_SCHEDULE to take effect."
           break
         fi
       done

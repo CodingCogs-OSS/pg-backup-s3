@@ -1,9 +1,10 @@
 #!/bin/sh
-# pg-backup-s3-entrypoint: default command of the image.
+# backup-s3-entrypoint: default command of the images. Installed under an
+# image-specific name (pg-backup-s3-entrypoint / mongo-backup-s3-entrypoint).
 #
 # Starts one lightweight cron scheduler per S3 destination that has its own
-# S3_SCHEDULE[_N], then hands over to the base image's /init.sh (which schedules
-# the dumps themselves). Destinations without a schedule are still synced by the
+# S3_SCHEDULE[_N], then hands over to the image's /init.sh (which schedules the
+# dumps themselves). Destinations without a schedule are still synced by the
 # post-backup hook right after each dump.
 #
 #   S3_SYNC_SCHEDULER=false   don't start the per-destination schedulers at all
@@ -17,7 +18,10 @@ SCHEDULER_MARKER="$STATE_DIR/scheduler-active"
 S3_SYNC_BIN="${S3_SYNC_BIN:-/usr/local/bin/s3-sync}"
 GO_CRON_BIN="${GO_CRON_BIN:-/usr/local/bin/go-cron}"
 
-log() { printf '[pg-backup-s3] %s\n' "$*" >&2; }
+# log tag follows the installed name: pg-backup-s3-entrypoint -> [pg-backup-s3]
+LOG_TAG="${0##*/}"
+LOG_TAG="${LOG_TAG%-entrypoint}"
+log() { printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
 
 is_true() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in

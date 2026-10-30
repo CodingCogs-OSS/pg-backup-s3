@@ -1,0 +1,93 @@
+# mongo-backup-s3: scheduled mongodump backups with the same S3 fan-out,
+# per-destination scheduling and encryption as pg-backup-s3.
+#
+# Build from the repository root (the context needs hooks/ and lib/):
+#   docker build -f docker/Dockerfile.mongo-backup -t cc0funobit/mongo-backup-s3:8.0 .
+#
+# Ubuntu rather than Debian: MongoDB only publishes arm64 Database Tools
+# packages for Ubuntu (the Debian ones are x86_64-only).
+FROM ubuntu:24.04
+
+# Database Tools 100.19.0 supports MongoDB Server 8.0 (and up to 9.0).
+ARG MONGO_TOOLS_VERSION=100.19.0
+ARG MONGO_TOOLS_SHA256_AMD64=af7a31c1247082e6e3fec0e76aefd6df0df0f1a64809b0aeb3b17adfe0090cb1
+ARG MONGO_TOOLS_SHA256_ARM64=b4b82477c2d0308afbd5be6cf86ea37112daa37b5c19b0df8c42142916d2d6cb
+# same go-cron as prodrigestivill/postgres-backup-local, so SCHEDULE and
+# S3_SCHEDULE accept exactly the same syntax in both images
+ARG GOCRONVER=v0.0.11
+ARG TARGETARCH
+ARG DEBIAN_FRONTEND=noninteractive
+
+# mongodump, AWS CLI v2, gnupg/openssl for optional encryption, util-linux for
+# flock, curl for the healthcheck and tzdata so TZ applies to cron schedules.
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+      amd64) tools_arch="x86_64";  tools_sha="$MONGO_TOOLS_SHA256_AMD64"; awscli_arch="x86_64" ;; \
+      arm64) tools_arch="arm64";   tools_sha="$MONGO_TOOLS_SHA256_ARM64"; awscli_arch="aarch64" ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip gnupg openssl util-linux tzdata; \
+    deb="/tmp/mongodb-database-tools.deb"; \
+    curl -fsSL --retry 4 -o "$deb" \
+      "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-${tools_arch}-${MONGO_TOOLS_VERSION}.deb"; \
+    echo "${tools_sha}  ${deb}" | sha256sum -c -; \
+    apt-get install -y --no-install-recommends "$deb"; \
+    rm -f "$deb"; \
+    curl -fsSL --retry 4 "https://github.com/prodrigestivill/go-cron/releases/download/${GOCRONVER}/go-cron-linux-${arch}.gz" \
+      | gzip -d > /usr/local/bin/go-cron; \
+    chmod +x /usr/local/bin/go-cron; \
+    curl -fsSL --retry 4 "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip; \
+    unzip -q /tmp/awscliv2.zip -d /tmp; \
+    /tmp/aws/install; \
+    rm -rf /tmp/aws /tmp/awscliv2.zip; \
+    apt-get purge -y --auto-remove unzip; \
+    rm -rf /var/lib/apt/lists/*; \
+    mongodump --version; \
+    aws --version; \
+    flock --version
+
+# Defaults mirror postgres-backup-local where the meaning is the same.
+# BACKUP_LATEST_TYPE=none: S3 has no links, so -latest links would upload every
+# archive a second time. S3_PREFIX / S3_SYNC_STATE_DIR are this image's
+# defaults for the shared s3-sync.
+ENV MONGO_PORT=27017 \
+    MONGO_AUTH_DB=admin \
+    MONGO_EXTRA_OPTS="" \
+    SCHEDULE="@daily" \
+    VALIDATE_ON_START="TRUE" \
+    BACKUP_ON_START="FALSE" \
+    BACKUP_DIR="/backups" \
+    BACKUP_SUFFIX=".archive.gz" \
+    BACKUP_LATEST_TYPE="none" \
+    BACKUP_KEEP_DAYS=7 \
+    BACKUP_KEEP_WEEKS=4 \
+    BACKUP_KEEP_MONTHS=6 \
+    BACKUP_KEEP_MINS=1440 \
+    HEALTHCHECK_PORT=8080 \
+    S3_PREFIX="mongo-backups" \
+    S3_SYNC_STATE_DIR="/tmp/mongo-backup-s3"
+
+COPY lib/s3-sync /usr/local/bin/s3-sync
+COPY lib/backup-s3-entrypoint /usr/local/bin/mongo-backup-s3-entrypoint
+COPY lib/mongo/init.sh /init.sh
+COPY lib/mongo/env.sh /env.sh
+COPY lib/mongo/backup.sh /backup.sh
+COPY hooks/ /hooks/
+# Strip any CR so a CRLF-saved script can't break the shebang, then mark exec.
+RUN set -eux; \
+    scripts="/hooks/* /usr/local/bin/s3-sync /usr/local/bin/mongo-backup-s3-entrypoint /init.sh /env.sh /backup.sh"; \
+    sed -i 's/\r$//' $scripts; \
+    chmod +x $scripts; \
+    for s in $scripts; do sh -n "$s"; done; \
+    mkdir -p /backups
+
+VOLUME /backups
+
+# go-cron's status endpoint: unauthenticated, so don't publish this port.
+HEALTHCHECK --interval=5m --timeout=3s \
+  CMD curl -f "http://localhost:$HEALTHCHECK_PORT/" || exit 1
+
+CMD ["/usr/local/bin/mongo-backup-s3-entrypoint"]

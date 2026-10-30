@@ -26,14 +26,14 @@ RUN set -eux; \
 # s3-sync holds all the S3/encryption/scheduling logic; the entrypoint wrapper
 # starts one cron scheduler per destination that has its own S3_SCHEDULE and
 # then hands over to the base image's /init.sh.
-COPY lib/s3-sync lib/pg-backup-s3-entrypoint /usr/local/bin/
+COPY lib/s3-sync /usr/local/bin/s3-sync
+COPY lib/backup-s3-entrypoint /usr/local/bin/pg-backup-s3-entrypoint
 COPY hooks/ /hooks/
 # Strip any CR so a CRLF-saved script can't make the kernel read the shebang as
 # "/bin/sh\r" (which fails with "No such file or directory"), then mark exec.
 RUN set -eux; \
     sed -i 's/\r$//' /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
     chmod +x /hooks/* /usr/local/bin/s3-sync /usr/local/bin/pg-backup-s3-entrypoint; \
-    rm -f /hooks/Dockerfile.pg-backup; \
     sh -n /usr/local/bin/s3-sync; \
     sh -n /usr/local/bin/pg-backup-s3-entrypoint; \
     sh -n /hooks/post-backup

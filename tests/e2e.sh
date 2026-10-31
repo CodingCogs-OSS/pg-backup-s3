@@ -361,8 +361,17 @@ if [ "$KIND" = pg ]; then
     retry 90 docker exec "$P-$_d" pg_isready -h 127.0.0.1 -U postgres || fail "$_d did not come up"
   done
 else
-  docker run -d --name "$P-db" --network "$P-net" "mongo:$VERSION" --auth >/dev/null || fail "cannot start db"
-  docker run -d --name "$P-db2" --network "$P-net" "mongo:$VERSION" >/dev/null || fail "cannot start db2"
+  # mongod 8.0+ refuses to start on Linux 6.19 through 7.0.13 (SERVER-121912),
+  # which GitHub's runners use. Disabling TCMalloc's per-CPU cache avoids the
+  # crash the guard protects against; GLIBC_TUNABLES (set by the official images)
+  # must be unset, not emptied, or the guard comes back. Harmless on 7.0.
+  mongo_run() {
+    _n="$1"; shift
+    docker run -d --name "$_n" --network "$P-net" --entrypoint env "mongo:$VERSION" \
+      -u GLIBC_TUNABLES MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=0 docker-entrypoint.sh mongod "$@"
+  }
+  mongo_run "$P-db" --auth >/dev/null || fail "cannot start db"
+  mongo_run "$P-db2" >/dev/null || fail "cannot start db2"
   for _d in db db2; do
     retry 90 docker exec "$P-$_d" mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' || fail "$_d did not come up"
   done

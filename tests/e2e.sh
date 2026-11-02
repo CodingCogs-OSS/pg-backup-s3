@@ -327,7 +327,7 @@ _want=$(printf 'primary\thot\tafter-backup\n2\tdr\t- schedule="0 4 * * 0"')
 # ---- T3 startup rejection of unparseable cron specs ----
 log "T3 bad cron specs"
 docker run -d --name "$P-bad1" -e S3_BUCKET=hot -e 'S3_SCHEDULE=not a cron' "$IMAGE" >/dev/null || fail "cannot start bad1"
-docker run -d --name "$P-bad2" -e 'SCHEDULE=every day' -e VALIDATE_ON_START=FALSE "$IMAGE" >/dev/null || fail "cannot start bad2"
+docker run -d --name "$P-bad2" -e 'SCHEDULE=@daily' -e VALIDATE_ON_START=FALSE "$IMAGE" >/dev/null || fail "cannot start bad2"
 exited() { [ "$(docker inspect -f '{{.State.Status}}' "$1")" = exited ]; }
 for _c in bad1 bad2; do
   retry 30 exited "$P-$_c" || fail "$_c did not exit on an invalid cron spec"
